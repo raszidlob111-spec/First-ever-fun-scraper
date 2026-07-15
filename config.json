@@ -1,0 +1,12 @@
+{
+    "category_url": "https://hardverapro.hu/aprok/hardver/videokartya/index.html",
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "request_delay_seconds": 1.5,
+    "max_pages": 40,
+    "interval_minutes": 10,
+    "discount_threshold": 0.25,
+    "min_sample_size": 3,
+    "db_path": "watcher_state.db",
+    "log_path": "watcher.log",
+    "discord_webhook_url": "https://discord.com/api/webhooks/1526949511749173339/mKGJNxsTq6-D5VP3I3oN93nL0evhJu0_2-CzDmJZQJVutCh544sGp1ZBvL6X-Q4roCkI"
+}
