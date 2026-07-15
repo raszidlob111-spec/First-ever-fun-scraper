@@ -5,21 +5,37 @@ import requests
 
 log = logging.getLogger("discord")
 
-EMBED_COLOR = 0x57F287  # green
 MAX_EMBEDS_PER_MESSAGE = 10  # Discord webhook limit
 DELAY_BETWEEN_MESSAGES = 1.5  # seconds, stay under Discord's per-webhook rate limit
+
+# Color scales with how good the deal is -- gold for a solid deal, escalating to
+# purple for the standout ones.
+COLOR_TIERS = [
+    (40, 0x992D22),  # deep red/purple -- exceptional
+    (25, 0xED4245),  # red -- great
+    (15, 0xE67E22),  # orange -- good
+    (0, 0xFEE75C),   # gold -- qualifies
+]
+
+
+def _color_for_discount(discount_pct: float) -> int:
+    for cutoff, color in COLOR_TIERS:
+        if discount_pct >= cutoff:
+            return color
+    return COLOR_TIERS[-1][1]
 
 
 def _build_embed(listing: dict, median: float, discount_pct: float) -> dict:
     embed = {
         "title": listing["title"][:256],
         "url": listing["url"],
-        "color": EMBED_COLOR,
+        "color": _color_for_discount(discount_pct),
         "fields": [
             {"name": "Price", "value": f"{listing['price']:,} Ft", "inline": True},
             {"name": "Model median", "value": f"{median:,.0f} Ft", "inline": True},
             {"name": "Below median", "value": f"{discount_pct}%", "inline": True},
             {"name": "Model", "value": listing["model_key"], "inline": True},
+            {"name": "Posted", "value": listing.get("posted_display") or "n/a", "inline": True},
             {"name": "Seller", "value": f"{listing.get('seller') or 'n/a'} ({listing.get('rating') or 'n/a'})", "inline": True},
             {"name": "Location", "value": listing.get("location") or "n/a", "inline": True},
         ],

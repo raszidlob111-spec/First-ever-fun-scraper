@@ -4,7 +4,7 @@
     "request_delay_seconds": 1.5,
     "max_pages": 40,
     "interval_minutes": 10,
-    "discount_threshold": 0.25,
+    "discount_threshold": 0.10,
     "min_sample_size": 3,
     "db_path": "watcher_state.db",
     "log_path": "watcher.log",

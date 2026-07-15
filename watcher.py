@@ -3,6 +3,7 @@ import logging
 import statistics
 import sys
 import time
+from datetime import datetime
 
 import discord_notify
 import pricing
@@ -49,8 +50,11 @@ def run_cycle(conn, config: dict) -> None:
         price, reserved = pricing.parse_price(listing["price_text"])
         if price is None or reserved:
             continue
+        posted_at, posted_display = pricing.parse_posted_at(listing.get("posted_raw"))
         listing["model_key"] = model_key
         listing["price"] = price
+        listing["posted_at"] = posted_at
+        listing["posted_display"] = posted_display
         valid.append(listing)
 
     by_model = {}
@@ -73,16 +77,25 @@ def run_cycle(conn, config: dict) -> None:
             if not storage.is_alerted(conn, listing["ad_id"]):
                 flagged.append((listing, median))
 
+    # Oldest first, newest last -- on Discord the last embed in a message sits at
+    # the bottom, i.e. closest to the reader's eye, so the newest finds end up there.
+    def _posted_sort_key(entry):
+        dt = entry[0].get("posted_at")
+        return (0, datetime.min) if dt is None else (1, dt.replace(tzinfo=None))
+
+    flagged.sort(key=_posted_sort_key)
+
     alerts = []
     for listing, median in flagged:
         discount_pct = round((1 - listing["price"] / median) * 100, 1)
         log.info(
-            "UNDERPRICED [%s] %s -- %s Ft (median %s Ft, %s%% below) -- seller=%s rating=%s loc=%s -- %s",
+            "UNDERPRICED [%s] %s -- %s Ft (median %s Ft, %s%% below) -- posted=%s seller=%s rating=%s loc=%s -- %s",
             listing["model_key"],
             listing["title"],
             f"{listing['price']:,}",
             f"{median:,.0f}",
             discount_pct,
+            listing.get("posted_display"),
             listing.get("seller"),
             listing.get("rating"),
             listing.get("location"),

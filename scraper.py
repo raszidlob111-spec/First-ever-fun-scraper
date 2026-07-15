@@ -71,6 +71,9 @@ def parse_listing_cards(html: str):
         city_div = li.select_one(".uad-cities")
         location = city_div.get_text(strip=True) if city_div else None
 
+        time_div = li.select_one(".uad-col-info .uad-time")
+        posted_raw = time_div.get_text(" ", strip=True) if time_div else None
+
         img_tag = li.select_one(".uad-col-image img")
         image_url = img_tag.get("src") if img_tag else None
         if image_url and image_url.startswith("//"):
@@ -86,6 +89,7 @@ def parse_listing_cards(html: str):
                 "rating": rating,
                 "location": location,
                 "image_url": image_url,
+                "posted_raw": posted_raw,
             }
         )
 
