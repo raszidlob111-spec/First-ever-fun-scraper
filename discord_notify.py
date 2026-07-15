@@ -34,6 +34,7 @@ def _build_embed(listing: dict, median: float, discount_pct: float) -> dict:
             {"name": "Price", "value": f"{listing['price']:,} Ft", "inline": True},
             {"name": "Model median", "value": f"{median:,.0f} Ft", "inline": True},
             {"name": "Below median", "value": f"{discount_pct}%", "inline": True},
+            {"name": "Category", "value": listing.get("category_label") or "n/a", "inline": True},
             {"name": "Model", "value": listing["model_key"], "inline": True},
             {"name": "Posted", "value": listing.get("posted_display") or "n/a", "inline": True},
             {"name": "Seller", "value": f"{listing.get('seller') or 'n/a'} ({listing.get('rating') or 'n/a'})", "inline": True},
@@ -74,7 +75,7 @@ def send_deal_alerts(webhook_url: str, alerts: list) -> None:
         embeds = [_build_embed(listing, median, discount_pct) for listing, median, discount_pct in chunk]
         payload = {"username": "GPU Deal Watcher", "embeds": embeds}
         if i == 0:
-            payload["content"] = f"Found **{len(alerts)}** new underpriced GPU listing(s):"
+            payload["content"] = f"Found **{len(alerts)}** new underpriced listing(s):"
 
         try:
             _post_with_retry(webhook_url, payload)

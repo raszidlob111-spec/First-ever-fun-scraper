@@ -1,5 +1,10 @@
 {
-    "category_url": "https://hardverapro.hu/aprok/hardver/videokartya/index.html",
+    "categories": [
+        {"key": "gpu", "label": "GPU", "url": "https://hardverapro.hu/aprok/hardver/videokartya/index.html"},
+        {"key": "cpu", "label": "CPU", "url": "https://hardverapro.hu/aprok/hardver/processzor/index.html"},
+        {"key": "ram", "label": "RAM", "url": "https://hardverapro.hu/aprok/hardver/memoria/index.html"},
+        {"key": "ssd", "label": "SSD", "url": "https://hardverapro.hu/aprok/hardver/merevlemez_ssd/index.html"}
+    ],
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "request_delay_seconds": 1.5,
     "max_pages": 40,

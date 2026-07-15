@@ -7,8 +7,18 @@ from datetime import datetime
 
 import discord_notify
 import pricing
+import pricing_cpu
+import pricing_ram
+import pricing_ssd
 import scraper
 import storage
+
+NORMALIZERS = {
+    "gpu": pricing.normalize_model,
+    "cpu": pricing_cpu.normalize_model,
+    "ram": pricing_ram.normalize_model,
+    "ssd": pricing_ssd.normalize_model,
+}
 
 
 def load_config(path: str = "config.json") -> dict:
@@ -33,18 +43,26 @@ def setup_logging(log_path: str) -> None:
 def run_cycle(conn, config: dict) -> None:
     log = logging.getLogger("watcher")
 
-    raw_listings = scraper.fetch_all_listings(
-        config["category_url"],
-        config["user_agent"],
-        config["request_delay_seconds"],
-        config["max_pages"],
-    )
+    raw_listings = []
+    for cat in config["categories"]:
+        cat_listings = scraper.fetch_all_listings(
+            cat["url"],
+            config["user_agent"],
+            config["request_delay_seconds"],
+            config["max_pages"],
+        )
+        for listing in cat_listings:
+            listing["category_key"] = cat["key"]
+            listing["category_label"] = cat["label"]
+        log.info("Scraped %d listings from %s", len(cat_listings), cat["label"])
+        raw_listings.extend(cat_listings)
 
     valid = []
     for listing in raw_listings:
         if pricing.is_excluded(listing["title"]):
             continue
-        model_key = pricing.normalize_model(listing["title"])
+        normalize_fn = NORMALIZERS[listing["category_key"]]
+        model_key = normalize_fn(listing["title"])
         if not model_key:
             continue
         price, reserved = pricing.parse_price(listing["price_text"])
@@ -57,20 +75,22 @@ def run_cycle(conn, config: dict) -> None:
         listing["posted_display"] = posted_display
         valid.append(listing)
 
-    by_model = {}
+    by_group = {}
     for listing in valid:
-        by_model.setdefault(listing["model_key"], []).append(listing["price"])
+        group_key = (listing["category_key"], listing["model_key"])
+        by_group.setdefault(group_key, []).append(listing["price"])
 
     medians = {
-        model: statistics.median(prices)
-        for model, prices in by_model.items()
+        group: statistics.median(prices)
+        for group, prices in by_group.items()
         if len(prices) >= config["min_sample_size"]
     }
 
     threshold = config["discount_threshold"]
     flagged = []
     for listing in valid:
-        median = medians.get(listing["model_key"])
+        group_key = (listing["category_key"], listing["model_key"])
+        median = medians.get(group_key)
         if median is None:
             continue
         if listing["price"] <= median * (1 - threshold):
@@ -89,7 +109,8 @@ def run_cycle(conn, config: dict) -> None:
     for listing, median in flagged:
         discount_pct = round((1 - listing["price"] / median) * 100, 1)
         log.info(
-            "UNDERPRICED [%s] %s -- %s Ft (median %s Ft, %s%% below) -- posted=%s seller=%s rating=%s loc=%s -- %s",
+            "UNDERPRICED [%s/%s] %s -- %s Ft (median %s Ft, %s%% below) -- posted=%s seller=%s rating=%s loc=%s -- %s",
+            listing["category_label"],
             listing["model_key"],
             listing["title"],
             f"{listing['price']:,}",
@@ -109,7 +130,7 @@ def run_cycle(conn, config: dict) -> None:
     storage.upsert_seen(conn, valid)
 
     log.info(
-        "Cycle done: %d scraped, %d priced GPU listings, %d models with enough samples, %d new deals flagged.",
+        "Cycle done: %d scraped, %d priced listings, %d models with enough samples, %d new deals flagged.",
         len(raw_listings), len(valid), len(medians), len(flagged),
     )
 
@@ -120,8 +141,9 @@ def main() -> None:
     conn = storage.init_db(config["db_path"])
     log = logging.getLogger("watcher")
 
-    log.info("Starting GPU price watcher (interval=%s min, threshold=%s%%)",
-              config["interval_minutes"], config["discount_threshold"] * 100)
+    labels = ", ".join(c["label"] for c in config["categories"])
+    log.info("Starting price watcher [%s] (interval=%s min, threshold=%s%%)",
+              labels, config["interval_minutes"], config["discount_threshold"] * 100)
 
     while True:
         try:
