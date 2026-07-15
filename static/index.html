@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hardver Figyelő</title>
+<style>
+  :root {
+    --bg: #12151c; --panel: #1a1f2b; --panel2: #212836; --border: #2c3446;
+    --text: #e6e9ef; --muted: #8a92a6; --accent: #5b8cff; --good: #4caf6b;
+    --warn: #e6b04c; --bad: #e05a5a; --pin: #f2c744;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    background: var(--bg); color: var(--text); font-size: 14px;
+  }
+  header {
+    padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 18px; margin: 0; margin-right: 8px; white-space: nowrap; }
+  .tabs { display: flex; gap: 6px; }
+  .tab {
+    padding: 6px 14px; border-radius: 6px; cursor: pointer; background: var(--panel2);
+    border: 1px solid var(--border); color: var(--muted);
+  }
+  .tab.active { background: var(--accent); color: white; border-color: var(--accent); }
+  .filters {
+    display: flex; gap: 10px; padding: 12px 20px; flex-wrap: wrap; align-items: center;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  input, select, button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 10px; font-size: 13px;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: white; }
+  .layout { display: grid; grid-template-columns: 340px 1fr; gap: 0; height: calc(100vh - 112px); }
+  .panel { overflow-y: auto; padding: 14px; }
+  .panel + .panel { border-left: 1px solid var(--border); }
+  .model-row {
+    padding: 8px 10px; border-radius: 6px; cursor: pointer; margin-bottom: 4px;
+    display: flex; justify-content: space-between; gap: 8px;
+  }
+  .model-row:hover { background: var(--panel2); }
+  .model-row.active { background: var(--panel2); border: 1px solid var(--accent); }
+  .model-row .name { font-weight: 600; }
+  .model-row .meta { color: var(--muted); font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); font-size: 13px; }
+  th { color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--bg); }
+  tr.listing-row { cursor: pointer; }
+  tr.listing-row:hover { background: var(--panel2); }
+  tr.listing-row.county-hit { background: rgba(76,175,107,0.12); }
+  .price { font-weight: 600; }
+  .pin-btn { background: none; border: none; font-size: 15px; padding: 2px 6px; color: var(--muted); }
+  .pin-btn.pinned { color: var(--pin); }
+  .detail-row td { background: var(--panel2); padding: 10px; }
+  .detail-row table { margin-top: 4px; }
+  .county-badge {
+    display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px;
+    background: var(--panel2); border: 1px solid var(--border); color: var(--muted);
+  }
+  .county-badge.target { background: var(--good); color: white; border-color: var(--good); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  #compare-panel {
+    position: fixed; bottom: 0; left: 0; right: 0; background: var(--panel);
+    border-top: 1px solid var(--border); max-height: 40vh; overflow-y: auto;
+    padding: 10px 20px; display: none;
+  }
+  #compare-panel.open { display: block; }
+  #compare-toggle {
+    position: fixed; bottom: 14px; right: 20px; z-index: 5;
+  }
+  .empty { color: var(--muted); padding: 20px; text-align: center; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Hardver Figyelő</h1>
+  <div class="tabs" id="category-tabs"></div>
+</header>
+
+<div class="filters">
+  <input id="search" type="text" placeholder="Keresés modell/cím alapján...">
+  <select id="county-filter">
+    <option value="">Minden vármegye</option>
+  </select>
+  <button id="quick-county">Csak Szabolcs-Szatmár-Bereg</button>
+  <button id="reset-filters">Alaphelyzet</button>
+  <span style="margin-left:auto; color: var(--muted)" id="result-count"></span>
+</div>
+
+<div class="layout">
+  <div class="panel" id="model-panel"></div>
+  <div class="panel" id="listing-panel"></div>
+</div>
+
+<button id="compare-toggle" class="primary">Összehasonlítás (<span id="pin-count">0</span>)</button>
+<div id="compare-panel"></div>
+
+<script>
+const state = {
+  category: null,
+  categories: [],
+  county: '',
+  q: '',
+  model: null, // {category_key, model_key}
+  expandedAdId: null,
+};
+
+const PINS_KEY = 'hap_pinned_ads';
+function getPins() { try { return JSON.parse(localStorage.getItem(PINS_KEY) || '[]'); } catch { return []; } }
+function setPins(list) { localStorage.setItem(PINS_KEY, JSON.stringify(list)); renderPinCount(); }
+function isPinned(adId) { return getPins().some(p => p.ad_id === adId); }
+function togglePin(listing) {
+  let pins = getPins();
+  if (isPinned(listing.ad_id)) {
+    pins = pins.filter(p => p.ad_id !== listing.ad_id);
+  } else {
+    pins.push(listing);
+  }
+  setPins(pins);
+  renderComparePanel();
+}
+function renderPinCount() {
+  document.getElementById('pin-count').textContent = getPins().length;
+}
+
+async function fetchJSON(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('request failed: ' + url);
+  return res.json();
+}
+
+function fmtFt(n) {
+  if (n === null || n === undefined) return 'n/a';
+  return Math.round(n).toLocaleString('hu-HU') + ' Ft';
+}
+
+async function init() {
+  const [{categories}, {counties}] = await Promise.all([
+    fetchJSON('/api/categories'), fetchJSON('/api/counties')
+  ]);
+  state.categories = categories;
+  const tabsEl = document.getElementById('category-tabs');
+  tabsEl.innerHTML = '';
+  categories.forEach((c, i) => {
+    const tab = document.createElement('div');
+    tab.className = 'tab' + (i === 0 ? ' active' : '');
+    tab.textContent = c.category_label;
+    tab.dataset.key = c.category_key;
+    tab.onclick = () => selectCategory(c.category_key);
+    tabsEl.appendChild(tab);
+  });
+  if (categories.length) state.category = categories[0].category_key;
+
+  const countySelect = document.getElementById('county-filter');
+  counties.forEach(c => {
+    const opt = document.createElement('option');
+    opt.value = c; opt.textContent = c;
+    countySelect.appendChild(opt);
+  });
+
+  document.getElementById('search').addEventListener('input', debounce(e => {
+    state.q = e.target.value.trim(); state.model = null; refresh();
+  }, 300));
+  countySelect.addEventListener('change', e => { state.county = e.target.value; refresh(); });
+  document.getElementById('quick-county').addEventListener('click', () => {
+    state.county = 'Szabolcs-Szatmár-Bereg';
+    countySelect.value = state.county;
+    refresh();
+  });
+  document.getElementById('reset-filters').addEventListener('click', () => {
+    state.county = ''; state.q = ''; state.model = null;
+    countySelect.value = ''; document.getElementById('search').value = '';
+    refresh();
+  });
+  document.getElementById('compare-toggle').addEventListener('click', () => {
+    document.getElementById('compare-panel').classList.toggle('open');
+    renderComparePanel();
+  });
+
+  renderPinCount();
+  refresh();
+}
+
+function debounce(fn, ms) {
+  let t; return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+}
+
+function selectCategory(key) {
+  state.category = key; state.model = null; state.expandedAdId = null;
+  document.querySelectorAll('#category-tabs .tab').forEach(t => {
+    t.classList.toggle('active', t.dataset.key === key);
+  });
+  refresh();
+}
+
+async function refresh() {
+  await Promise.all([loadModels(), loadListings()]);
+}
+
+async function loadModels() {
+  const params = new URLSearchParams();
+  if (state.category) params.set('category', state.category);
+  if (state.q) params.set('q', state.q);
+  const { models } = await fetchJSON('/api/models?' + params);
+
+  const panel = document.getElementById('model-panel');
+  panel.innerHTML = '';
+  if (!models.length) {
+    panel.innerHTML = '<div class="empty">Nincs adat még ehhez a kategóriához.</div>';
+    return;
+  }
+  models.forEach(m => {
+    const row = document.createElement('div');
+    const active = state.model && state.model.model_key === m.model_key && state.model.category_key === m.category_key;
+    row.className = 'model-row' + (active ? ' active' : '');
+    row.innerHTML = `
+      <div>
+        <div class="name">${m.model_key}</div>
+        <div class="meta">${m.count} db · ${fmtFt(m.min_price)} – ${fmtFt(m.max_price)}</div>
+      </div>
+      <div class="meta" style="text-align:right">
+        <div>medián</div>
+        <div class="price">${fmtFt(m.median_price)}</div>
+      </div>`;
+    row.onclick = () => {
+      state.model = { category_key: m.category_key, model_key: m.model_key };
+      state.expandedAdId = null;
+      loadModels(); loadListings();
+    };
+    panel.appendChild(row);
+  });
+}
+
+async function loadListings() {
+  const params = new URLSearchParams();
+  if (state.category) params.set('category', state.category);
+  if (state.county) params.set('county', state.county);
+  if (state.model) params.set('model', state.model.model_key);
+  if (state.q && !state.model) params.set('q', state.q);
+  const { listings } = await fetchJSON('/api/listings?' + params);
+
+  document.getElementById('result-count').textContent = listings.length + ' hirdetés';
+
+  const panel = document.getElementById('listing-panel');
+  panel.innerHTML = '';
+  if (!listings.length) {
+    panel.innerHTML = '<div class="empty">Nincs találat.</div>';
+    return;
+  }
+
+  const table = document.createElement('table');
+  table.innerHTML = `<thead><tr>
+    <th></th><th>Cím</th><th>Modell</th><th>Ár</th><th>Vármegye</th>
+    <th>Eladó</th><th>Feladva</th>
+  </tr></thead>`;
+  const tbody = document.createElement('tbody');
+
+  listings.forEach(l => {
+    const tr = document.createElement('tr');
+    tr.className = 'listing-row' + (l.county === 'Szabolcs-Szatmár-Bereg' ? ' county-hit' : '');
+    const pinned = isPinned(l.ad_id);
+    tr.innerHTML = `
+      <td><button class="pin-btn${pinned ? ' pinned' : ''}" data-ad="${l.ad_id}">★</button></td>
+      <td><a href="${l.url}" target="_blank" rel="noopener">${escapeHtml(l.title)}</a></td>
+      <td>${l.model_key || ''}</td>
+      <td class="price">${fmtFt(l.price)}</td>
+      <td><span class="county-badge${l.county === 'Szabolcs-Szatmár-Bereg' ? ' target' : ''}">${l.county || 'Ismeretlen'}</span></td>
+      <td>${escapeHtml(l.seller || '')} ${l.rating ? '(' + escapeHtml(l.rating) + ')' : ''}</td>
+      <td>${escapeHtml(l.posted_display || '')}</td>
+    `;
+    tr.querySelector('.pin-btn').onclick = (e) => { e.stopPropagation(); togglePin(l); e.target.classList.toggle('pinned'); };
+    tr.addEventListener('click', (e) => {
+      if (e.target.closest('a') || e.target.closest('button')) return;
+      toggleExpand(l.ad_id, tr);
+    });
+    tbody.appendChild(tr);
+
+    if (state.expandedAdId === l.ad_id) {
+      tbody.appendChild(buildDetailRow(l));
+    }
+  });
+
+  table.appendChild(tbody);
+  panel.appendChild(table);
+}
+
+async function toggleExpand(adId, rowEl) {
+  if (state.expandedAdId === adId) {
+    state.expandedAdId = null;
+  } else {
+    state.expandedAdId = adId;
+  }
+  await loadListings();
+}
+
+function buildDetailRow(listing) {
+  const tr = document.createElement('tr');
+  tr.className = 'detail-row';
+  const td = document.createElement('td');
+  td.colSpan = 7;
+  td.innerHTML = '<div class="empty">Betöltés...</div>';
+  tr.appendChild(td);
+
+  fetchJSON('/api/listings/' + encodeURIComponent(listing.ad_id)).then(({ similar }) => {
+    if (!similar.length) {
+      td.innerHTML = '<div class="empty">Nincs más ugyanilyen típusú hirdetés.</div>';
+      return;
+    }
+    const sub = document.createElement('table');
+    sub.innerHTML = `<thead><tr><th>Vármegye</th><th>Cím</th><th>Ár</th><th>Eladó</th><th>Feladva</th></tr></thead>`;
+    const body = document.createElement('tbody');
+    similar.forEach(s => {
+      const row = document.createElement('tr');
+      row.innerHTML = `
+        <td><span class="county-badge${s.county === 'Szabolcs-Szatmár-Bereg' ? ' target' : ''}">${s.county || 'Ismeretlen'}</span></td>
+        <td><a href="${s.url}" target="_blank" rel="noopener">${escapeHtml(s.title)}</a></td>
+        <td class="price">${fmtFt(s.price)}</td>
+        <td>${escapeHtml(s.seller || '')}</td>
+        <td>${escapeHtml(s.posted_display || '')}</td>
+      `;
+      body.appendChild(row);
+    });
+    sub.appendChild(body);
+    td.innerHTML = `<strong>${listing.model_key}</strong> -- ugyanilyen típusú hirdetések vármegyénként:`;
+    td.appendChild(sub);
+  });
+
+  return tr;
+}
+
+function renderComparePanel() {
+  const panel = document.getElementById('compare-panel');
+  const pins = getPins();
+  if (!pins.length) {
+    panel.innerHTML = '<div class="empty">Nincs kitűzött hirdetés. Kattints a ★ gombra egy hirdetésnél.</div>';
+    return;
+  }
+  const table = document.createElement('table');
+  table.innerHTML = `<thead><tr>
+    <th></th><th>Kategória</th><th>Modell</th><th>Cím</th><th>Ár</th><th>Vármegye</th><th>Eladó</th>
+  </tr></thead>`;
+  const tbody = document.createElement('tbody');
+  pins.forEach(l => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><button class="pin-btn pinned" data-ad="${l.ad_id}">✕</button></td>
+      <td>${escapeHtml(l.category_label || '')}</td>
+      <td>${escapeHtml(l.model_key || '')}</td>
+      <td><a href="${l.url}" target="_blank" rel="noopener">${escapeHtml(l.title)}</a></td>
+      <td class="price">${fmtFt(l.price)}</td>
+      <td><span class="county-badge${l.county === 'Szabolcs-Szatmár-Bereg' ? ' target' : ''}">${l.county || 'Ismeretlen'}</span></td>
+      <td>${escapeHtml(l.seller || '')}</td>
+    `;
+    tr.querySelector('.pin-btn').onclick = () => { togglePin(l); renderComparePanel(); loadListings(); };
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  panel.innerHTML = '';
+  panel.appendChild(table);
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str == null ? '' : String(str);
+  return div.innerHTML;
+}
+
+init();
+</script>
+</body>
+</html>

@@ -1,6 +1,8 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 watcher_state.db
+watcher_state.db-shm
+watcher_state.db-wal
 *.py[codz]
 *$py.class
 
