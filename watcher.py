@@ -73,6 +73,7 @@ def run_cycle(conn, config: dict) -> None:
             if not storage.is_alerted(conn, listing["ad_id"]):
                 flagged.append((listing, median))
 
+    alerts = []
     for listing, median in flagged:
         discount_pct = round((1 - listing["price"] / median) * 100, 1)
         log.info(
@@ -87,8 +88,10 @@ def run_cycle(conn, config: dict) -> None:
             listing.get("location"),
             listing["url"],
         )
-        discord_notify.send_deal_alert(config.get("discord_webhook_url"), listing, median, discount_pct)
+        alerts.append((listing, median, discount_pct))
         storage.mark_alerted(conn, listing)
+
+    discord_notify.send_deal_alerts(config.get("discord_webhook_url"), alerts)
 
     storage.upsert_seen(conn, valid)
 
