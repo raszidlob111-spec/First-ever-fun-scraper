@@ -64,6 +64,21 @@
     background: var(--panel2); border: 1px solid var(--border); color: var(--muted);
   }
   .county-badge.target { background: var(--good); color: white; border-color: var(--good); }
+  .heat {
+    display: inline-block; min-width: 38px; padding: 1px 6px; border-radius: 4px;
+    font-size: 11px; font-weight: 600; text-align: center;
+    background: var(--panel2); color: var(--muted);
+  }
+  .heat.hot { background: rgba(224,90,90,0.18); color: #ff8b8b; }
+  .heat.warm { background: rgba(230,176,76,0.18); color: var(--warn); }
+  .heat.cold { background: rgba(138,146,166,0.12); color: var(--muted); }
+  .stale { color: var(--muted); font-style: italic; }
+  #market-view { display: none; overflow-y: auto; height: calc(100vh - 112px); padding: 14px; }
+  #market-view.open { display: block; }
+  .note {
+    background: var(--panel2); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 4px; padding: 8px 12px; margin-bottom: 12px; color: var(--muted); font-size: 12px;
+  }
   a { color: var(--accent); text-decoration: none; }
   a:hover { text-decoration: underline; }
   #compare-panel {
@@ -83,28 +98,37 @@
 <header>
   <h1>Hardver Figyelő</h1>
   <div class="tabs" id="category-tabs"></div>
+  <div class="tabs" id="view-tabs" style="margin-left:auto">
+    <div class="tab active" data-view="browse">Böngészés</div>
+    <div class="tab" data-view="market">Piac</div>
+  </div>
 </header>
 
 <div class="filters">
   <input id="search" type="text" placeholder="Keresés modell/cím alapján...">
-  <select id="county-filter">
-    <option value="">Minden vármegye</option>
-  </select>
-  <button id="quick-county">Csak Szabolcs-Szatmár-Bereg</button>
+  <span id="county-controls" style="display:contents">
+    <select id="county-filter">
+      <option value="">Minden vármegye</option>
+    </select>
+    <button id="quick-county">Csak Szabolcs-Szatmár-Bereg</button>
+  </span>
   <button id="reset-filters">Alaphelyzet</button>
   <span style="margin-left:auto; color: var(--muted)" id="result-count"></span>
 </div>
 
-<div class="layout">
+<div class="layout" id="browse-view">
   <div class="panel" id="model-panel"></div>
   <div class="panel" id="listing-panel"></div>
 </div>
+
+<div id="market-view"></div>
 
 <button id="compare-toggle" class="primary">Összehasonlítás (<span id="pin-count">0</span>)</button>
 <div id="compare-panel"></div>
 
 <script>
 const state = {
+  view: 'browse', // 'browse' | 'market'
   category: null,
   categories: [],
   county: '',
@@ -140,6 +164,44 @@ async function fetchJSON(url) {
 function fmtFt(n) {
   if (n === null || n === undefined) return 'n/a';
   return Math.round(n).toLocaleString('hu-HU') + ' Ft';
+}
+
+function fmtDays(d) {
+  if (d === null || d === undefined) return '–';
+  if (d < 1) return Math.round(d * 24) + ' óra';
+  return d.toFixed(1) + ' nap';
+}
+
+function fmtAgo(iso) {
+  if (!iso) return '–';
+  const mins = Math.floor((Date.now() - new Date(iso)) / 60000);
+  if (mins < 60) return mins + ' perce';
+  if (mins < 1440) return Math.floor(mins / 60) + ' órája';
+  return Math.floor(mins / 1440) + ' napja';
+}
+
+// Share of a model's recent supply that cleared. Thin samples get greyed out rather
+// than hidden -- 1-of-2 is technically 50% but shouldn't read as a hot market.
+function heatHtml(m) {
+  if (m.sell_through_30d === null || m.sell_through_30d === undefined) {
+    return '<span class="heat cold">–</span>';
+  }
+  const pct = Math.round(m.sell_through_30d * 100);
+  let cls = 'cold';
+  if (m.sample_size >= 4) {
+    if (pct >= 50) cls = 'hot';
+    else if (pct >= 25) cls = 'warm';
+  }
+  return `<span class="heat ${cls}">${pct}%</span>`;
+}
+
+function liquidityLine(m) {
+  if (!m.closed_30d) return '<span class="stale">nincs még forgalmi adat</span>';
+  const bits = [`${m.closed_30d} zárult/30n`];
+  if (m.median_days_to_close !== null && m.median_days_to_close !== undefined) {
+    bits.push('~' + fmtDays(m.median_days_to_close));
+  }
+  return heatHtml(m) + ' ' + bits.join(' · ');
 }
 
 async function init() {
@@ -180,6 +242,9 @@ async function init() {
     countySelect.value = ''; document.getElementById('search').value = '';
     refresh();
   });
+  document.querySelectorAll('#view-tabs .tab').forEach(t => {
+    t.addEventListener('click', () => switchView(t.dataset.view));
+  });
   document.getElementById('compare-toggle').addEventListener('click', () => {
     document.getElementById('compare-panel').classList.toggle('open');
     renderComparePanel();
@@ -201,8 +266,83 @@ function selectCategory(key) {
   refresh();
 }
 
+function switchView(view) {
+  state.view = view;
+  document.querySelectorAll('#view-tabs .tab').forEach(t => {
+    t.classList.toggle('active', t.dataset.view === view);
+  });
+  document.getElementById('browse-view').style.display = view === 'browse' ? 'grid' : 'none';
+  document.getElementById('market-view').classList.toggle('open', view === 'market');
+  // County is a property of an individual ad, not of a model's turnover, so it has
+  // nothing to filter in the market view.
+  document.getElementById('county-controls').style.display = view === 'browse' ? 'contents' : 'none';
+  refresh();
+}
+
 async function refresh() {
+  if (state.view === 'market') return loadMarket();
   await Promise.all([loadModels(), loadListings()]);
+}
+
+async function loadMarket() {
+  const params = new URLSearchParams({ order: 'hot' });
+  if (state.category) params.set('category', state.category);
+  if (state.q) params.set('q', state.q);
+  const { models } = await fetchJSON('/api/models?' + params);
+
+  const view = document.getElementById('market-view');
+  view.innerHTML = '';
+  document.getElementById('result-count').textContent = models.length + ' modell';
+
+  const note = document.createElement('div');
+  note.className = 'note';
+  note.innerHTML = 'A hardverapro ugyanúgy archiválja a hirdetést, akár elkelt, akár '
+    + 'visszavonták vagy lejárt — ezért <strong>lezárás</strong>, nem garantált eladás. '
+    + 'A „Forgás” az elmúlt 30 nap lezárásainak aránya a teljes kínálathoz képest.';
+  view.appendChild(note);
+
+  if (!models.length) {
+    view.insertAdjacentHTML('beforeend', '<div class="empty">Nincs adat ehhez a kategóriához.</div>');
+    return;
+  }
+  if (!models.some(m => m.closed_30d)) {
+    view.insertAdjacentHTML('beforeend',
+      '<div class="empty">Még nincs lezárási adat — a figyelő mostantól gyűjti. '
+      + 'Az első használható számokhoz kb. egy nap folyamatos futás kell.</div>');
+  }
+
+  const table = document.createElement('table');
+  table.innerHTML = `<thead><tr>
+    <th>Forgás</th><th>Modell</th><th>Aktív</th><th>Zárult 7n</th><th>Zárult 30n</th>
+    <th>Medián idő</th><th>Utolsó zárás</th><th>Medián ár</th><th>Lezárt medián</th>
+  </tr></thead>`;
+  const tbody = document.createElement('tbody');
+
+  models.forEach(m => {
+    const tr = document.createElement('tr');
+    tr.className = 'listing-row';
+    tr.innerHTML = `
+      <td>${heatHtml(m)}</td>
+      <td><strong>${escapeHtml(m.model_key)}</strong></td>
+      <td>${m.count}</td>
+      <td>${m.closed_7d}</td>
+      <td>${m.closed_30d}</td>
+      <td>${fmtDays(m.median_days_to_close)}</td>
+      <td>${fmtAgo(m.last_closed_at)}</td>
+      <td class="price">${fmtFt(m.median_price)}</td>
+      <td>${fmtFt(m.median_closed_price)}</td>
+    `;
+    // Jump straight from "this is hot" to "what's on sale right now".
+    tr.onclick = () => {
+      state.model = { category_key: m.category_key, model_key: m.model_key };
+      state.expandedAdId = null;
+      switchView('browse');
+    };
+    tbody.appendChild(tr);
+  });
+
+  table.appendChild(tbody);
+  view.appendChild(table);
 }
 
 async function loadModels() {
@@ -225,6 +365,7 @@ async function loadModels() {
       <div>
         <div class="name">${m.model_key}</div>
         <div class="meta">${m.count} db · ${fmtFt(m.min_price)} – ${fmtFt(m.max_price)}</div>
+        <div class="meta">${liquidityLine(m)}</div>
       </div>
       <div class="meta" style="text-align:right">
         <div>medián</div>

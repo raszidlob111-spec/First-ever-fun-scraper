@@ -25,13 +25,64 @@ CREATE TABLE IF NOT EXISTS seen_ads (
     last_seen TEXT,
     alerted INTEGER DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS scrape_runs (
+    id BIGSERIAL PRIMARY KEY,
+    category_key TEXT NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL,
+    listing_count INTEGER NOT NULL,
+    complete BOOLEAN NOT NULL
+);
 """
+
+# Applied on every startup; each statement is a no-op once it has run.
+MIGRATIONS = [
+    "ALTER TABLE seen_ads ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'",
+    "ALTER TABLE seen_ads ADD COLUMN IF NOT EXISTS gone_at TIMESTAMPTZ",
+    "ALTER TABLE seen_ads ADD COLUMN IF NOT EXISTS posted_at TIMESTAMPTZ",
+    "ALTER TABLE seen_ads ADD COLUMN IF NOT EXISTS arrival_confirmed BOOLEAN NOT NULL DEFAULT TRUE",
+    "CREATE INDEX IF NOT EXISTS idx_seen_ads_market ON seen_ads (category_key, model_key, status)",
+    "CREATE INDEX IF NOT EXISTS idx_seen_ads_gone_at ON seen_ads (gone_at)",
+    "CREATE INDEX IF NOT EXISTS idx_scrape_runs_cat ON scrape_runs (category_key, started_at DESC)",
+]
+
+# The ads already in the table when this column was added arrived in one flood on
+# the watcher's very first cycle, so their first_seen is "when we started looking",
+# not "when it was posted" -- their lifetime is unknowable and must not pollute the
+# time-to-close median.
+BACKFILL_ARRIVAL = """
+UPDATE seen_ads SET arrival_confirmed = FALSE
+WHERE arrival_confirmed
+  AND first_seen IS NOT NULL
+  AND first_seen::timestamptz < (
+      SELECT MIN(first_seen::timestamptz) + interval '15 minutes'
+      FROM seen_ads WHERE first_seen IS NOT NULL
+  )
+"""
+
+# A cycle that scraped far fewer ads than usual was probably truncated by a failed
+# page fetch rather than by 30% of the market selling out in ten minutes. Refuse to
+# read closures out of a run that shrank by more than this much.
+GONE_MIN_COUNT_RATIO = 0.7
+
+# How many prior runs to median when deciding whether a run looks truncated.
+BASELINE_RUNS = 10
+
+
+def connect(database_url: str = None) -> psycopg.Connection:
+    """A plain connection, for readers that trust the schema to already exist."""
+    dsn = database_url or os.environ["DATABASE_URL"]
+    return psycopg.connect(dsn, row_factory=dict_row)
 
 
 def init_db(database_url: str = None) -> psycopg.Connection:
-    dsn = database_url or os.environ["DATABASE_URL"]
-    conn = psycopg.connect(dsn, row_factory=dict_row)
+    """Connect and bring the schema up to date. Call once per process at startup --
+    the migrations are cheap but not free, so request handlers should use connect()."""
+    conn = connect(database_url)
     conn.execute(SCHEMA)
+    for statement in MIGRATIONS:
+        conn.execute(statement)
+    conn.execute(BACKFILL_ARRIVAL)
     conn.commit()
     return conn
 
@@ -46,7 +97,87 @@ def mark_alerted(conn: psycopg.Connection, listing: dict) -> None:
     conn.commit()
 
 
-def upsert_seen(conn: psycopg.Connection, listings: list) -> None:
+def has_scrape_history(conn: psycopg.Connection, category_key: str) -> bool:
+    """Whether we've ever seen this category in full.
+
+    Only complete runs count. A category whose first runs all failed has still never
+    been fully observed, so it stays in bootstrap until one succeeds -- otherwise the
+    backfill would be skipped and the first good run would date every ad that piled up
+    beforehand as closing at that instant, inventing a spike of closures.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM scrape_runs WHERE category_key = %s AND complete LIMIT 1",
+        (category_key,),
+    ).fetchone()
+    return row is not None
+
+
+def record_scrape_run(conn: psycopg.Connection, category_key: str, started_at: datetime,
+                       listing_count: int, complete: bool) -> None:
+    conn.execute(
+        "INSERT INTO scrape_runs (category_key, started_at, listing_count, complete) "
+        "VALUES (%s, %s, %s, %s)",
+        (category_key, started_at, listing_count, complete),
+    )
+    conn.commit()
+
+
+def _baseline_count(conn: psycopg.Connection, category_key: str):
+    """Median listing_count of recent trustworthy runs, or None if there's no history."""
+    rows = conn.execute(
+        "SELECT listing_count FROM scrape_runs "
+        "WHERE category_key = %s AND complete ORDER BY started_at DESC LIMIT %s",
+        (category_key, BASELINE_RUNS),
+    ).fetchall()
+    counts = sorted(r["listing_count"] for r in rows)
+    if not counts:
+        return None
+    n = len(counts)
+    return counts[n // 2] if n % 2 else (counts[n // 2 - 1] + counts[n // 2]) / 2
+
+
+def mark_gone(conn: psycopg.Connection, category_key: str, present_ad_ids: set,
+               gone_at: datetime, complete: bool, backfill: bool = False) -> int:
+    """Close out every active ad in this category that the site no longer lists.
+
+    hardverapro archives an ad when it leaves the index -- whether it sold, was
+    withdrawn, or expired looks identical from outside -- so this records a
+    *closure*, not a confirmed sale.
+
+    `present_ad_ids` must be every ad id scraped this cycle, including ones the
+    watcher filtered out (reserved, unparseable price, ...): those are still live
+    listings, and treating them as gone would invent closures every cycle.
+
+    `backfill=True` closes the ads out without a timestamp: on the first cycle for
+    a category, everything missing has been gone for an unknown length of time, and
+    stamping it all with now() would fake a spike of closures. Returns the number of
+    ads closed, or 0 if the run looked too short to trust.
+    """
+    if not complete:
+        return 0
+
+    baseline = _baseline_count(conn, category_key)
+    if baseline is not None and len(present_ad_ids) < baseline * GONE_MIN_COUNT_RATIO:
+        return 0
+
+    cur = conn.execute(
+        "UPDATE seen_ads SET status = 'gone', gone_at = %s "
+        "WHERE category_key = %s AND status = 'active' AND NOT (ad_id = ANY(%s))",
+        (None if backfill else gone_at, category_key, list(present_ad_ids)),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def upsert_seen(conn: psycopg.Connection, listings: list, bootstrap_categories=frozenset()) -> None:
+    """Insert/refresh the ads seen this cycle.
+
+    An ad first seen during a category's very first cycle was already on the site
+    when we started watching, so we never saw it arrive and its age is a lower bound
+    -- `bootstrap_categories` marks those as arrival_confirmed = FALSE so the
+    time-to-close median only uses ads we watched from birth. An ad that reappears
+    after being closed goes back to active, which quietly undoes a false closure.
+    """
     now = datetime.now(timezone.utc).isoformat()
     for l in listings:
         county = counties.resolve_county(l.get("location"))
@@ -54,10 +185,11 @@ def upsert_seen(conn: psycopg.Connection, listings: list) -> None:
             """
             INSERT INTO seen_ads (
                 ad_id, title, category_key, category_label, model_key, price, url,
-                seller, rating, location, county, posted_display, image_url,
-                first_seen, last_seen, alerted
+                seller, rating, location, county, posted_display, posted_at, image_url,
+                first_seen, last_seen, alerted, status, gone_at, arrival_confirmed
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0,
+                    'active', NULL, %s)
             ON CONFLICT (ad_id) DO UPDATE SET
                 title=excluded.title,
                 category_key=excluded.category_key,
@@ -70,14 +202,18 @@ def upsert_seen(conn: psycopg.Connection, listings: list) -> None:
                 location=excluded.location,
                 county=excluded.county,
                 posted_display=excluded.posted_display,
+                posted_at=excluded.posted_at,
                 image_url=excluded.image_url,
-                last_seen=excluded.last_seen
+                last_seen=excluded.last_seen,
+                status='active',
+                gone_at=NULL
             """,
             (
                 l["ad_id"], l["title"], l.get("category_key"), l.get("category_label"),
                 l.get("model_key"), l.get("price"), l["url"], l.get("seller"), l.get("rating"),
-                l.get("location"), county, l.get("posted_display"), l.get("image_url"),
-                now, now,
+                l.get("location"), county, l.get("posted_display"), l.get("posted_at"),
+                l.get("image_url"), now, now,
+                l.get("category_key") not in bootstrap_categories,
             ),
         )
     conn.commit()
@@ -90,15 +226,42 @@ def get_categories(conn: psycopg.Connection):
     return [dict(r) for r in rows]
 
 
-def get_model_summary(conn: psycopg.Connection, category_key: str = None, q: str = None):
-    sql = """
-        SELECT category_key, category_label, model_key,
-               COUNT(*) AS count,
-               MIN(price) AS min_price,
-               MAX(price) AS max_price
-        FROM seen_ads
-        WHERE model_key IS NOT NULL AND price IS NOT NULL
+MARKET_SQL = """
+    SELECT
+        category_key,
+        category_label,
+        model_key,
+        COUNT(*) FILTER (WHERE status = 'active') AS count,
+        MIN(price) FILTER (WHERE status = 'active') AS min_price,
+        MAX(price) FILTER (WHERE status = 'active') AS max_price,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY price::double precision)
+            FILTER (WHERE status = 'active') AS median_price,
+        COUNT(*) FILTER (WHERE status = 'gone' AND gone_at >= now() - interval '7 days')
+            AS closed_7d,
+        COUNT(*) FILTER (WHERE status = 'gone' AND gone_at >= now() - interval '30 days')
+            AS closed_30d,
+        MAX(gone_at) AS last_closed_at,
+        percentile_cont(0.5) WITHIN GROUP (
+            ORDER BY EXTRACT(EPOCH FROM (gone_at - first_seen::timestamptz)) / 86400.0
+        ) FILTER (WHERE status = 'gone' AND gone_at IS NOT NULL AND arrival_confirmed)
+            AS median_days_to_close,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY price::double precision)
+            FILTER (WHERE status = 'gone' AND gone_at >= now() - interval '30 days')
+            AS median_closed_price
+    FROM seen_ads
+    WHERE model_key IS NOT NULL AND price IS NOT NULL
+"""
+
+
+def get_model_summary(conn: psycopg.Connection, category_key: str = None, q: str = None,
+                       order: str = "count"):
+    """Per-model price spread plus how fast that model turns over.
+
+    Prices describe the *active* market -- ads that have already closed shouldn't
+    set the asking price you compare against. Closure counts and the time-to-close
+    median describe how liquid the model is, i.e. whether a flip will actually move.
     """
+    sql = MARKET_SQL
     params = []
     if category_key:
         sql += " AND category_key = %s"
@@ -106,28 +269,40 @@ def get_model_summary(conn: psycopg.Connection, category_key: str = None, q: str
     if q:
         sql += " AND model_key ILIKE %s"
         params.append(f"%{q}%")
-    sql += " GROUP BY category_key, category_label, model_key ORDER BY count DESC"
+
+    sql += """
+        GROUP BY category_key, category_label, model_key
+        HAVING COUNT(*) FILTER (WHERE status = 'active') > 0
+            OR COUNT(*) FILTER (WHERE status = 'gone' AND gone_at IS NOT NULL) > 0
+    """
 
     rows = [dict(r) for r in conn.execute(sql, params)]
 
-    # Median isn't a builtin aggregate here -- compute it per group in Python.
     for row in rows:
-        prices = [
-            r["price"] for r in conn.execute(
-                "SELECT price FROM seen_ads WHERE category_key = %s AND model_key = %s AND price IS NOT NULL",
-                (row["category_key"], row["model_key"]),
-            )
-        ]
-        prices.sort()
-        n = len(prices)
-        row["median_price"] = prices[n // 2] if n % 2 else (prices[n // 2 - 1] + prices[n // 2]) / 2
+        # Share of the model's recent supply that actually cleared. Undefined until
+        # something has happened either way, and noisy on tiny samples -- the UI
+        # shows the raw counts next to it so a 1-of-2 doesn't read as a hot market.
+        pool = row["closed_30d"] + row["count"]
+        row["sell_through_30d"] = row["closed_30d"] / pool if pool else None
+        row["sample_size"] = pool
+
+    if order == "hot":
+        rows.sort(key=lambda r: (r["sell_through_30d"] or 0, r["closed_30d"]), reverse=True)
+    else:
+        rows.sort(key=lambda r: r["count"], reverse=True)
 
     return rows
 
 
+def get_market_stats(conn: psycopg.Connection):
+    """Every model's turnover stats, keyed by (category_key, model_key)."""
+    rows = get_model_summary(conn)
+    return {(r["category_key"], r["model_key"]): r for r in rows}
+
+
 def get_listings(conn: psycopg.Connection, category_key: str = None, model_key: str = None,
                   county: str = None, q: str = None, limit: int = 300):
-    sql = "SELECT * FROM seen_ads WHERE price IS NOT NULL"
+    sql = "SELECT * FROM seen_ads WHERE price IS NOT NULL AND status = 'active'"
     params = []
     if category_key:
         sql += " AND category_key = %s"
@@ -152,10 +327,11 @@ def get_listing(conn: psycopg.Connection, ad_id: str):
     return dict(row) if row else None
 
 
-def get_similar_by_county(conn: psycopg.Connection, category_key: str, model_key: str, exclude_ad_id: str = None):
+def get_similar_by_county(conn: psycopg.Connection, category_key: str, model_key: str,
+                           exclude_ad_id: str = None):
     sql = """
         SELECT * FROM seen_ads
-        WHERE category_key = %s AND model_key = %s AND price IS NOT NULL
+        WHERE category_key = %s AND model_key = %s AND price IS NOT NULL AND status = 'active'
     """
     params = [category_key, model_key]
     if exclude_ad_id:
@@ -168,3 +344,17 @@ def get_similar_by_county(conn: psycopg.Connection, category_key: str, model_key
     # counties in the first place.
     rows.sort(key=lambda r: (counties._fold(r["county"] or ""), r["price"]))
     return rows
+
+
+def get_recent_closures(conn: psycopg.Connection, category_key: str = None, limit: int = 100):
+    sql = """
+        SELECT * FROM seen_ads
+        WHERE status = 'gone' AND gone_at IS NOT NULL AND price IS NOT NULL
+    """
+    params = []
+    if category_key:
+        sql += " AND category_key = %s"
+        params.append(category_key)
+    sql += " ORDER BY gone_at DESC LIMIT %s"
+    params.append(limit)
+    return [dict(r) for r in conn.execute(sql, params)]

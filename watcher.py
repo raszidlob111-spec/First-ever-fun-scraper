@@ -3,7 +3,7 @@ import logging
 import statistics
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import discord_notify
 import pricing
@@ -42,10 +42,20 @@ def setup_logging(log_path: str) -> None:
 
 def run_cycle(conn, config: dict) -> None:
     log = logging.getLogger("watcher")
+    cycle_start = datetime.now(timezone.utc)
+
+    # A category with no scrape history is one we've never watched before, so every
+    # ad in it was already posted when we arrived -- neither its age nor the closure
+    # of anything missing from it can be dated. Decided before recording this run.
+    bootstrap = {
+        cat["key"] for cat in config["categories"]
+        if not storage.has_scrape_history(conn, cat["key"])
+    }
 
     raw_listings = []
+    scrapes = {}
     for cat in config["categories"]:
-        cat_listings = scraper.fetch_all_listings(
+        cat_listings, complete = scraper.fetch_all_listings(
             cat["url"],
             config["user_agent"],
             config["request_delay_seconds"],
@@ -54,7 +64,11 @@ def run_cycle(conn, config: dict) -> None:
         for listing in cat_listings:
             listing["category_key"] = cat["key"]
             listing["category_label"] = cat["label"]
-        log.info("Scraped %d listings from %s", len(cat_listings), cat["label"])
+        scrapes[cat["key"]] = ({l["ad_id"] for l in cat_listings}, complete)
+        log.info(
+            "Scraped %d listings from %s%s",
+            len(cat_listings), cat["label"], "" if complete else " (INCOMPLETE)",
+        )
         raw_listings.extend(cat_listings)
 
     valid = []
@@ -105,10 +119,32 @@ def run_cycle(conn, config: dict) -> None:
 
     flagged.sort(key=_posted_sort_key)
 
+    storage.upsert_seen(conn, valid, bootstrap_categories=bootstrap)
+
+    # Close out ads the site no longer lists, then bank this run as the baseline the
+    # next cycle checks itself against. Compared against every id we scraped (not just
+    # the priced ones) so a reserved or unparseable ad isn't mistaken for a sale.
+    closed_total = 0
+    for cat in config["categories"]:
+        present, complete = scrapes[cat["key"]]
+        closed = storage.mark_gone(
+            conn, cat["key"], present, cycle_start, complete,
+            backfill=cat["key"] in bootstrap,
+        )
+        if closed and cat["key"] in bootstrap:
+            log.info("Backfilled %d already-closed %s ads (undated)", closed, cat["label"])
+        elif closed:
+            log.info("Closed %d %s ads no longer listed", closed, cat["label"])
+        closed_total += closed
+        storage.record_scrape_run(conn, cat["key"], cycle_start, len(present), complete)
+
+    market = storage.get_market_stats(conn)
+
     alerts = []
     for listing, median in flagged:
         discount_pct = round((1 - listing["price"] / median) * 100, 1)
         profit = median - listing["price"]
+        stats = market.get((listing["category_key"], listing["model_key"]))
         log.info(
             "UNDERPRICED [%s/%s] %s -- %s Ft (median %s Ft, profit %s Ft, %s%% below) -- posted=%s seller=%s rating=%s loc=%s -- %s",
             listing["category_label"],
@@ -124,16 +160,20 @@ def run_cycle(conn, config: dict) -> None:
             listing.get("location"),
             listing["url"],
         )
-        alerts.append((listing, median, discount_pct))
+        alerts.append((listing, median, discount_pct, stats))
         storage.mark_alerted(conn, listing)
 
     discord_notify.send_deal_alerts(config.get("discord_channels"), alerts)
 
-    storage.upsert_seen(conn, valid)
+    # Reads leave the connection "idle in transaction", and this one is about to sleep
+    # for the whole interval -- release the snapshot so it doesn't pin locks and stall
+    # vacuum (or a deploy's ALTER TABLE) while it waits.
+    conn.rollback()
 
     log.info(
-        "Cycle done: %d scraped, %d priced listings, %d models with enough samples, %d new deals flagged.",
-        len(raw_listings), len(valid), len(medians), len(flagged),
+        "Cycle done: %d scraped, %d priced listings, %d models with enough samples, "
+        "%d new deals flagged, %d ads closed.",
+        len(raw_listings), len(valid), len(medians), len(flagged), closed_total,
     )
 
 

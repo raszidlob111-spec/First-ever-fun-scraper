@@ -9,7 +9,7 @@ import web
 
 
 def _watcher_loop(config: dict) -> None:
-    conn = storage.init_db()
+    conn = storage.connect()
     log = logging.getLogger("watcher")
     while True:
         try:
@@ -22,6 +22,10 @@ def _watcher_loop(config: dict) -> None:
 def main() -> None:
     config = watcher.load_config()
     watcher.setup_logging(config["log_path"])
+
+    # Migrate before anything can read: the web thread serves requests immediately
+    # and the watcher thread assumes the schema is already in place.
+    storage.init_db().close()
 
     thread = threading.Thread(target=_watcher_loop, args=(config,), daemon=True)
     thread.start()

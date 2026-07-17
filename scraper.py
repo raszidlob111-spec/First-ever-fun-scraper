@@ -8,7 +8,13 @@ log = logging.getLogger("scraper")
 
 
 def fetch_all_listings(category_url: str, user_agent: str, delay_seconds: float, max_pages: int):
-    """Paginate through the category (index.html?offset=N) and return raw listing dicts."""
+    """Paginate through the category (index.html?offset=N).
+
+    Returns (listings, complete). `complete` is True only when we reached the real
+    end of the category. Callers infer sold/withdrawn ads from what's *missing*
+    between cycles, so a run cut short by a failed fetch or by the max_pages ceiling
+    must not be mistaken for "the rest of the market disappeared".
+    """
     session = requests.Session()
     session.headers.update({"User-Agent": user_agent})
 
@@ -22,11 +28,11 @@ def fetch_all_listings(category_url: str, user_agent: str, delay_seconds: float,
             resp.raise_for_status()
         except requests.RequestException:
             log.exception("Failed to fetch %s", url)
-            break
+            return listings, False
 
         cards = parse_listing_cards(resp.text)
         if not cards:
-            break
+            return listings, True
 
         new_on_page = 0
         for card in cards:
@@ -39,12 +45,14 @@ def fetch_all_listings(category_url: str, user_agent: str, delay_seconds: float,
         # A page with nothing new (e.g. only the pinned/boosted ads repeating) means we've
         # reached the end of the real listings.
         if new_on_page == 0 and page_num > 0:
-            break
+            return listings, True
 
         offset += 100
         time.sleep(delay_seconds)
 
-    return listings
+    # Ran out of pages before running out of listings -- the tail is unseen.
+    log.warning("Hit max_pages=%d on %s; listing tail not scraped", max_pages, category_url)
+    return listings, False
 
 
 def parse_listing_cards(html: str):

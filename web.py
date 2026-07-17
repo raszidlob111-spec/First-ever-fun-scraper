@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, g, jsonify, request, send_from_directory
 
 import counties
 import storage
@@ -8,10 +8,20 @@ def create_app() -> Flask:
     app = Flask(__name__, static_folder="static", static_url_path="")
 
     def get_conn():
-        # A fresh short-lived connection per request -- simple and correct
-        # alongside the watcher's own long-lived connection in its background
-        # thread; Postgres handles the concurrent connections natively.
-        return storage.init_db()
+        # One connection per request, closed on teardown. It has to be closed: even a
+        # read leaves the connection "idle in transaction", which pins a snapshot --
+        # enough of them and Postgres runs out of connections, and meanwhile the open
+        # locks stall vacuum and any ALTER TABLE a deploy tries to run.
+        # Readers skip the migrations; startup has already run them.
+        if "conn" not in g:
+            g.conn = storage.connect()
+        return g.conn
+
+    @app.teardown_appcontext
+    def close_conn(exc):
+        conn = g.pop("conn", None)
+        if conn is not None:
+            conn.close()
 
     @app.get("/")
     def index():
@@ -33,8 +43,19 @@ def create_app() -> Flask:
             conn,
             category_key=request.args.get("category") or None,
             q=request.args.get("q") or None,
+            order=request.args.get("order") or "count",
         )
         return jsonify({"models": rows})
+
+    @app.get("/api/closures")
+    def api_closures():
+        conn = get_conn()
+        rows = storage.get_recent_closures(
+            conn,
+            category_key=request.args.get("category") or None,
+            limit=int(request.args.get("limit", 100)),
+        )
+        return jsonify({"closures": rows})
 
     @app.get("/api/listings")
     def api_listings():
