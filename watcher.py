@@ -177,22 +177,54 @@ def run_cycle(conn, config: dict) -> None:
     )
 
 
-def main() -> None:
-    config = load_config()
-    setup_logging(config["log_path"])
+def run_once(config: dict) -> int:
+    """One cycle, then exit -- the shape a Railway cron job needs.
+
+    Railway expects a cron service to "terminate as soon as that task is finished,
+    leaving no open resources", and to close database connections explicitly, so the
+    connection is closed here rather than left to interpreter shutdown. Returns an
+    exit code: a failed cycle exits non-zero so the run shows up as failed rather
+    than silently succeeding. There's no retry -- the next scheduled run is the
+    retry, which also keeps a failing cycle from hammering the site.
+    """
+    log = logging.getLogger("watcher")
+    conn = storage.init_db()
+    try:
+        run_cycle(conn, config)
+        return 0
+    except Exception:
+        log.exception("Cycle failed")
+        return 1
+    finally:
+        conn.close()
+
+
+def run_forever(config: dict) -> None:
     conn = storage.init_db()
     log = logging.getLogger("watcher")
-
-    labels = ", ".join(c["label"] for c in config["categories"])
-    log.info("Starting price watcher [%s] (interval=%s min, threshold=%s%%)",
-              labels, config["interval_minutes"], config["discount_threshold"] * 100)
-
+    log.info("interval=%s min", config["interval_minutes"])
     while True:
         try:
             run_cycle(conn, config)
         except Exception:
             log.exception("Cycle failed")
         time.sleep(config["interval_minutes"] * 60)
+
+
+def main() -> None:
+    config = load_config()
+    setup_logging(config["log_path"])
+    log = logging.getLogger("watcher")
+
+    labels = ", ".join(c["label"] for c in config["categories"])
+    once = "--once" in sys.argv
+    log.info("Starting price watcher [%s] (%s, threshold=%s%%)",
+              labels, "single cycle" if once else "continuous",
+              config["discount_threshold"] * 100)
+
+    if once:
+        sys.exit(run_once(config))
+    run_forever(config)
 
 
 if __name__ == "__main__":

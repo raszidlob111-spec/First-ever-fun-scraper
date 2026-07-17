@@ -1,3 +1,10 @@
+"""Web UI and watcher in one process -- the convenient way to run the whole thing
+locally with a single command.
+
+Railway does not use this entrypoint. There the two halves are separate services,
+because a cron job has to exit and a web server never does: `serve.py` (web, sleeps
+between visits) and `watcher.py --once` (cron). See railway.json / railway.watcher.json.
+"""
 import logging
 import os
 import threading
