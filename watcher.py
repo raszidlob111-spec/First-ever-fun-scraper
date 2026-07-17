@@ -108,13 +108,15 @@ def run_cycle(conn, config: dict) -> None:
     alerts = []
     for listing, median in flagged:
         discount_pct = round((1 - listing["price"] / median) * 100, 1)
+        profit = median - listing["price"]
         log.info(
-            "UNDERPRICED [%s/%s] %s -- %s Ft (median %s Ft, %s%% below) -- posted=%s seller=%s rating=%s loc=%s -- %s",
+            "UNDERPRICED [%s/%s] %s -- %s Ft (median %s Ft, profit %s Ft, %s%% below) -- posted=%s seller=%s rating=%s loc=%s -- %s",
             listing["category_label"],
             listing["model_key"],
             listing["title"],
             f"{listing['price']:,}",
             f"{median:,.0f}",
+            f"{profit:,.0f}",
             discount_pct,
             listing.get("posted_display"),
             listing.get("seller"),
@@ -125,7 +127,7 @@ def run_cycle(conn, config: dict) -> None:
         alerts.append((listing, median, discount_pct))
         storage.mark_alerted(conn, listing)
 
-    discord_notify.send_deal_alerts(config.get("discord_webhook_url"), alerts)
+    discord_notify.send_deal_alerts(config.get("discord_channels"), alerts)
 
     storage.upsert_seen(conn, valid)
 
@@ -138,7 +140,7 @@ def run_cycle(conn, config: dict) -> None:
 def main() -> None:
     config = load_config()
     setup_logging(config["log_path"])
-    conn = storage.init_db(config["db_path"])
+    conn = storage.init_db()
     log = logging.getLogger("watcher")
 
     labels = ", ".join(c["label"] for c in config["categories"])

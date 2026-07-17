@@ -11,7 +11,17 @@
     "interval_minutes": 10,
     "discount_threshold": 0.10,
     "min_sample_size": 3,
-    "db_path": "watcher_state.db",
     "log_path": "watcher.log",
-    "discord_webhook_url": "https://discord.com/api/webhooks/1526949511749173339/mKGJNxsTq6-D5VP3I3oN93nL0evhJu0_2-CzDmJZQJVutCh544sGp1ZBvL6X-Q4roCkI"
+    "discord_channels": [
+        {
+            "label": "High profit (9500+ Ft)",
+            "webhook_url": "https://discord.com/api/webhooks/1526949511749173339/mKGJNxsTq6-D5VP3I3oN93nL0evhJu0_2-CzDmJZQJVutCh544sGp1ZBvL6X-Q4roCkI",
+            "min_profit_huf": 9500
+        },
+        {
+            "label": "Low profit (<9500 Ft)",
+            "webhook_url": "https://discord.com/api/webhooks/1527531051944251582/3moBtD8KkV3aJPHMU6uZR2J2VUv7qpAR8kdgUec6YsBC0aqx8qu3vgokdSa0Ngh_FHfh",
+            "min_profit_huf": 0
+        }
+    ]
 }

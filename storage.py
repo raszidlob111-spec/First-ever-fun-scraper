@@ -1,5 +1,8 @@
-import sqlite3
+import os
 from datetime import datetime, timezone
+
+import psycopg
+from psycopg.rows import dict_row
 
 import counties
 
@@ -24,47 +27,26 @@ CREATE TABLE IF NOT EXISTS seen_ads (
 );
 """
 
-# Columns added after the initial release -- migrated in via ALTER TABLE so an
-# existing local/production db doesn't need to be dropped.
-_MIGRATION_COLUMNS = [
-    ("category_key", "TEXT"),
-    ("category_label", "TEXT"),
-    ("rating", "TEXT"),
-    ("county", "TEXT"),
-    ("posted_display", "TEXT"),
-    ("image_url", "TEXT"),
-]
 
-
-def _migrate(conn: sqlite3.Connection) -> None:
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(seen_ads)")}
-    for name, col_type in _MIGRATION_COLUMNS:
-        if name not in existing:
-            conn.execute(f"ALTER TABLE seen_ads ADD COLUMN {name} {col_type}")
-    conn.commit()
-
-
-def init_db(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.row_factory = sqlite3.Row
+def init_db(database_url: str = None) -> psycopg.Connection:
+    dsn = database_url or os.environ["DATABASE_URL"]
+    conn = psycopg.connect(dsn, row_factory=dict_row)
     conn.execute(SCHEMA)
-    _migrate(conn)
     conn.commit()
     return conn
 
 
-def is_alerted(conn: sqlite3.Connection, ad_id: str) -> bool:
-    row = conn.execute("SELECT alerted FROM seen_ads WHERE ad_id = ?", (ad_id,)).fetchone()
-    return bool(row and row[0])
+def is_alerted(conn: psycopg.Connection, ad_id: str) -> bool:
+    row = conn.execute("SELECT alerted FROM seen_ads WHERE ad_id = %s", (ad_id,)).fetchone()
+    return bool(row and row["alerted"])
 
 
-def mark_alerted(conn: sqlite3.Connection, listing: dict) -> None:
-    conn.execute("UPDATE seen_ads SET alerted = 1 WHERE ad_id = ?", (listing["ad_id"],))
+def mark_alerted(conn: psycopg.Connection, listing: dict) -> None:
+    conn.execute("UPDATE seen_ads SET alerted = 1 WHERE ad_id = %s", (listing["ad_id"],))
     conn.commit()
 
 
-def upsert_seen(conn: sqlite3.Connection, listings: list) -> None:
+def upsert_seen(conn: psycopg.Connection, listings: list) -> None:
     now = datetime.now(timezone.utc).isoformat()
     for l in listings:
         county = counties.resolve_county(l.get("location"))
@@ -75,8 +57,8 @@ def upsert_seen(conn: sqlite3.Connection, listings: list) -> None:
                 seller, rating, location, county, posted_display, image_url,
                 first_seen, last_seen, alerted
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-            ON CONFLICT(ad_id) DO UPDATE SET
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0)
+            ON CONFLICT (ad_id) DO UPDATE SET
                 title=excluded.title,
                 category_key=excluded.category_key,
                 category_label=excluded.category_label,
@@ -101,14 +83,14 @@ def upsert_seen(conn: sqlite3.Connection, listings: list) -> None:
     conn.commit()
 
 
-def get_categories(conn: sqlite3.Connection):
+def get_categories(conn: psycopg.Connection):
     rows = conn.execute(
         "SELECT DISTINCT category_key, category_label FROM seen_ads WHERE category_key IS NOT NULL"
     ).fetchall()
     return [dict(r) for r in rows]
 
 
-def get_model_summary(conn: sqlite3.Connection, category_key: str = None, q: str = None):
+def get_model_summary(conn: psycopg.Connection, category_key: str = None, q: str = None):
     sql = """
         SELECT category_key, category_label, model_key,
                COUNT(*) AS count,
@@ -119,20 +101,20 @@ def get_model_summary(conn: sqlite3.Connection, category_key: str = None, q: str
     """
     params = []
     if category_key:
-        sql += " AND category_key = ?"
+        sql += " AND category_key = %s"
         params.append(category_key)
     if q:
-        sql += " AND model_key LIKE ?"
-        params.append(f"%{q.upper()}%")
-    sql += " GROUP BY category_key, model_key ORDER BY count DESC"
+        sql += " AND model_key ILIKE %s"
+        params.append(f"%{q}%")
+    sql += " GROUP BY category_key, category_label, model_key ORDER BY count DESC"
 
     rows = [dict(r) for r in conn.execute(sql, params)]
 
-    # Median isn't a builtin SQLite aggregate -- compute it per group in Python.
+    # Median isn't a builtin aggregate here -- compute it per group in Python.
     for row in rows:
         prices = [
             r["price"] for r in conn.execute(
-                "SELECT price FROM seen_ads WHERE category_key = ? AND model_key = ? AND price IS NOT NULL",
+                "SELECT price FROM seen_ads WHERE category_key = %s AND model_key = %s AND price IS NOT NULL",
                 (row["category_key"], row["model_key"]),
             )
         ]
@@ -143,46 +125,46 @@ def get_model_summary(conn: sqlite3.Connection, category_key: str = None, q: str
     return rows
 
 
-def get_listings(conn: sqlite3.Connection, category_key: str = None, model_key: str = None,
+def get_listings(conn: psycopg.Connection, category_key: str = None, model_key: str = None,
                   county: str = None, q: str = None, limit: int = 300):
     sql = "SELECT * FROM seen_ads WHERE price IS NOT NULL"
     params = []
     if category_key:
-        sql += " AND category_key = ?"
+        sql += " AND category_key = %s"
         params.append(category_key)
     if model_key:
-        sql += " AND model_key = ?"
+        sql += " AND model_key = %s"
         params.append(model_key)
     if county:
-        sql += " AND county = ?"
+        sql += " AND county = %s"
         params.append(county)
     if q:
-        sql += " AND title LIKE ?"
+        sql += " AND title ILIKE %s"
         params.append(f"%{q}%")
-    sql += " ORDER BY price ASC LIMIT ?"
+    sql += " ORDER BY price ASC LIMIT %s"
     params.append(limit)
 
     return [dict(r) for r in conn.execute(sql, params)]
 
 
-def get_listing(conn: sqlite3.Connection, ad_id: str):
-    row = conn.execute("SELECT * FROM seen_ads WHERE ad_id = ?", (ad_id,)).fetchone()
+def get_listing(conn: psycopg.Connection, ad_id: str):
+    row = conn.execute("SELECT * FROM seen_ads WHERE ad_id = %s", (ad_id,)).fetchone()
     return dict(row) if row else None
 
 
-def get_similar_by_county(conn: sqlite3.Connection, category_key: str, model_key: str, exclude_ad_id: str = None):
+def get_similar_by_county(conn: psycopg.Connection, category_key: str, model_key: str, exclude_ad_id: str = None):
     sql = """
         SELECT * FROM seen_ads
-        WHERE category_key = ? AND model_key = ? AND price IS NOT NULL
+        WHERE category_key = %s AND model_key = %s AND price IS NOT NULL
     """
     params = [category_key, model_key]
     if exclude_ad_id:
-        sql += " AND ad_id != ?"
+        sql += " AND ad_id != %s"
         params.append(exclude_ad_id)
 
     rows = [dict(r) for r in conn.execute(sql, params)]
-    # SQLite's default BINARY collation misorders accented Hungarian county
-    # names (e.g. "Bács-Kiskun" sorts after "Budapest"), so sort in Python
-    # using the same accent-folding used to resolve counties in the first place.
+    # Postgres's default collation can misorder accented Hungarian county
+    # names, so sort in Python using the same accent-folding used to resolve
+    # counties in the first place.
     rows.sort(key=lambda r: (counties._fold(r["county"] or ""), r["price"]))
     return rows

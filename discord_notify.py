@@ -25,7 +25,7 @@ def _color_for_discount(discount_pct: float) -> int:
     return COLOR_TIERS[-1][1]
 
 
-def _build_embed(listing: dict, median: float, discount_pct: float) -> dict:
+def _build_embed(listing: dict, median: float, discount_pct: float, profit: float) -> dict:
     embed = {
         "title": listing["title"][:256],
         "url": listing["url"],
@@ -33,6 +33,7 @@ def _build_embed(listing: dict, median: float, discount_pct: float) -> dict:
         "fields": [
             {"name": "Price", "value": f"{listing['price']:,} Ft", "inline": True},
             {"name": "Model median", "value": f"{median:,.0f} Ft", "inline": True},
+            {"name": "Profit", "value": f"{profit:,.0f} Ft", "inline": True},
             {"name": "Below median", "value": f"{discount_pct}%", "inline": True},
             {"name": "Category", "value": listing.get("category_label") or "n/a", "inline": True},
             {"name": "Model", "value": listing["model_key"], "inline": True},
@@ -60,27 +61,58 @@ def _post_with_retry(webhook_url: str, payload: dict) -> None:
     resp.raise_for_status()
 
 
-def send_deal_alerts(webhook_url: str, alerts: list) -> None:
-    """Post a batch of underpriced listings to a Discord webhook.
+def _channel_for_profit(channels: list, profit: float) -> dict:
+    """Pick the channel whose min_profit_huf is the highest threshold the
+    profit still clears. `channels` should cover down to 0 so every profit
+    matches something."""
+    best = None
+    for channel in channels:
+        threshold = channel.get("min_profit_huf", 0)
+        if profit >= threshold and (best is None or threshold > best.get("min_profit_huf", 0)):
+            best = channel
+    return best
 
-    `alerts` is a list of (listing, median, discount_pct) tuples. Up to
-    MAX_EMBEDS_PER_MESSAGE are packed into a single message to stay within
-    Discord's per-webhook rate limit; no-op if no URL is set or list is empty.
-    """
-    if not webhook_url or not alerts:
-        return
 
-    for i in range(0, len(alerts), MAX_EMBEDS_PER_MESSAGE):
-        chunk = alerts[i : i + MAX_EMBEDS_PER_MESSAGE]
-        embeds = [_build_embed(listing, median, discount_pct) for listing, median, discount_pct in chunk]
-        payload = {"username": "GPU Deal Watcher", "embeds": embeds}
+def _send_batch(webhook_url: str, label: str, embeds: list, total: int) -> None:
+    for i in range(0, len(embeds), MAX_EMBEDS_PER_MESSAGE):
+        chunk = embeds[i : i + MAX_EMBEDS_PER_MESSAGE]
+        payload = {"username": "GPU Deal Watcher", "embeds": chunk}
         if i == 0:
-            payload["content"] = f"Found **{len(alerts)}** new underpriced listing(s):"
+            payload["content"] = f"Found **{total}** new underpriced listing(s):"
 
         try:
             _post_with_retry(webhook_url, payload)
         except requests.RequestException:
-            log.exception("Failed to post Discord alert batch (%d items)", len(chunk))
+            log.exception("Failed to post Discord alert batch to %s (%d items)", label, len(chunk))
 
-        if i + MAX_EMBEDS_PER_MESSAGE < len(alerts):
+        if i + MAX_EMBEDS_PER_MESSAGE < len(embeds):
             time.sleep(DELAY_BETWEEN_MESSAGES)
+
+
+def send_deal_alerts(channels: list, alerts: list) -> None:
+    """Post a batch of underpriced listings to Discord, routed by profit
+    (median - price) to whichever channel's min_profit_huf it clears.
+
+    `channels` is a list of {label, webhook_url, min_profit_huf} dicts.
+    `alerts` is a list of (listing, median, discount_pct) tuples, already in
+    the desired display order -- that order is preserved within each channel.
+    No-op if no channels are configured or the alert list is empty.
+    """
+    if not channels or not alerts:
+        return
+
+    by_channel = {}
+    for listing, median, discount_pct in alerts:
+        profit = median - listing["price"]
+        channel = _channel_for_profit(channels, profit)
+        if channel is None:
+            log.warning("No Discord channel configured to cover profit=%.0f Ft, dropping alert", profit)
+            continue
+        by_channel.setdefault(channel["webhook_url"], (channel["label"], []))[1].append(
+            _build_embed(listing, median, discount_pct, profit)
+        )
+
+    for webhook_url, (label, embeds) in by_channel.items():
+        if not webhook_url:
+            continue
+        _send_batch(webhook_url, label, embeds, len(embeds))

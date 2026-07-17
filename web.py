@@ -4,14 +4,14 @@ import counties
 import storage
 
 
-def create_app(db_path: str) -> Flask:
+def create_app() -> Flask:
     app = Flask(__name__, static_folder="static", static_url_path="")
 
     def get_conn():
-        # A fresh short-lived connection per request keeps SQLite happy under
-        # concurrent access from Flask's request threads and the watcher's
-        # own background thread (both share the same WAL-mode db file).
-        return storage.init_db(db_path)
+        # A fresh short-lived connection per request -- simple and correct
+        # alongside the watcher's own long-lived connection in its background
+        # thread; Postgres handles the concurrent connections natively.
+        return storage.init_db()
 
     @app.get("/")
     def index():
