@@ -76,7 +76,7 @@ def _channel_for_profit(channels: list, profit: float) -> dict:
 def _send_batch(webhook_url: str, label: str, embeds: list, total: int) -> None:
     for i in range(0, len(embeds), MAX_EMBEDS_PER_MESSAGE):
         chunk = embeds[i : i + MAX_EMBEDS_PER_MESSAGE]
-        payload = {"username": "GPU Deal Watcher", "embeds": chunk}
+        payload = {"username": f"GPU Deal Watcher · {label}", "embeds": chunk}
         if i == 0:
             payload["content"] = f"Found **{total}** new underpriced listing(s):"
 
