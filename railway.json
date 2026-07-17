@@ -6,6 +6,7 @@
   },
   "deploy": {
     "startCommand": "python serve.py",
+    "cronSchedule": null,
     "runtime": "V2",
     "numReplicas": 1,
     "sleepApplication": true,
