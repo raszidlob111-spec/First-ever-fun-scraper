@@ -1,11 +1,37 @@
+import json
+
 from flask import Flask, g, jsonify, request, send_from_directory
 
 import counties
 import storage
 
 
-def create_app() -> Flask:
+def _load_category_order(path: str) -> list:
+    """The order the category tabs should appear in, taken from config.json.
+
+    seen_ads has no notion of order, so SELECT DISTINCT hands back the categories
+    however Postgres feels like it that day. config.json already lists them in the
+    intended order (GPU first), which makes it the natural source of truth -- and the
+    UI defaults to the first tab, so this decides the landing category too.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return [c["key"] for c in json.load(f)["categories"]]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+
+
+def _order_categories(rows: list, order: list) -> list:
+    """Sort rows by `order`; anything not listed keeps a stable spot at the end."""
+    def rank(row):
+        key = row.get("category_key")
+        return (order.index(key) if key in order else len(order), key or "")
+    return sorted(rows, key=rank)
+
+
+def create_app(config_path: str = "config.json") -> Flask:
     app = Flask(__name__, static_folder="static", static_url_path="")
+    category_order = _load_category_order(config_path)
 
     def get_conn():
         # One connection per request, closed on teardown. It has to be closed: even a
@@ -34,7 +60,8 @@ def create_app() -> Flask:
     @app.get("/api/categories")
     def api_categories():
         conn = get_conn()
-        return jsonify({"categories": storage.get_categories(conn)})
+        cats = _order_categories(storage.get_categories(conn), category_order)
+        return jsonify({"categories": cats})
 
     @app.get("/api/models")
     def api_models():
