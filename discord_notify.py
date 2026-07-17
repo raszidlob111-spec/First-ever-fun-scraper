@@ -30,11 +30,16 @@ def _liquidity_value(stats: dict) -> str:
     never sells is visibly different from a fat margin on something that does.
 
     hardverapro archives sold, withdrawn and expired ads identically, so these are
-    closures rather than confirmed sales -- hence "closed", not "sold"."""
+    closures rather than confirmed sales -- "closed" counts everything, "confirmed"
+    is the subset that passed through the site's own "jegelve" (reserved) marker
+    first, i.e. actually had a buyer lined up."""
     if not stats or not stats.get("closed_30d"):
         return "no closures tracked yet"
 
     parts = [f"{stats['closed_30d']} closed/30d"]
+    confirmed = stats.get("confirmed_closed_30d")
+    if confirmed:
+        parts.append(f"{confirmed} confirmed")
     days = stats.get("median_days_to_close")
     if days is not None:
         # Sub-day is the hottest signal there is -- "~0.1 days" would bury it.
@@ -46,14 +51,14 @@ def _liquidity_value(stats: dict) -> str:
 
 
 def _build_embed(listing: dict, median: float, discount_pct: float, profit: float,
-                  stats: dict = None) -> dict:
+                  stats: dict = None, basis: str = "asking price") -> dict:
     embed = {
         "title": listing["title"][:256],
         "url": listing["url"],
         "color": _color_for_discount(discount_pct),
         "fields": [
             {"name": "Price", "value": f"{listing['price']:,} Ft", "inline": True},
-            {"name": "Model median", "value": f"{median:,.0f} Ft", "inline": True},
+            {"name": f"Median ({basis})", "value": f"{median:,.0f} Ft", "inline": True},
             {"name": "Profit", "value": f"{profit:,.0f} Ft", "inline": True},
             {"name": "Below median", "value": f"{discount_pct}%", "inline": True},
             {"name": "Category", "value": listing.get("category_label") or "n/a", "inline": True},
@@ -117,23 +122,25 @@ def send_deal_alerts(channels: list, alerts: list) -> None:
     (median - price) to whichever channel's min_profit_huf it clears.
 
     `channels` is a list of {label, webhook_url, min_profit_huf} dicts.
-    `alerts` is a list of (listing, median, discount_pct, market_stats) tuples,
-    already in the desired display order -- that order is preserved within each
-    channel. `market_stats` may be None for a model with no turnover history yet.
-    No-op if no channels are configured or the alert list is empty.
+    `alerts` is a list of (listing, median, discount_pct, market_stats, basis)
+    tuples, already in the desired display order -- that order is preserved
+    within each channel. `market_stats` may be None for a model with no turnover
+    history yet. `basis` names what `median` was computed from (e.g. "confirmed
+    sales", "closed listings", "asking price"). No-op if no channels are
+    configured or the alert list is empty.
     """
     if not channels or not alerts:
         return
 
     by_channel = {}
-    for listing, median, discount_pct, stats in alerts:
+    for listing, median, discount_pct, stats, basis in alerts:
         profit = median - listing["price"]
         channel = _channel_for_profit(channels, profit)
         if channel is None:
             log.warning("No Discord channel configured to cover profit=%.0f Ft, dropping alert", profit)
             continue
         by_channel.setdefault(channel["webhook_url"], (channel["label"], []))[1].append(
-            _build_embed(listing, median, discount_pct, profit, stats)
+            _build_embed(listing, median, discount_pct, profit, stats, basis)
         )
 
     for webhook_url, (label, embeds) in by_channel.items():

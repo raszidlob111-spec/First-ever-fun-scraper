@@ -71,6 +71,10 @@ def run_cycle(conn, config: dict) -> None:
         )
         raw_listings.extend(cat_listings)
 
+    # A reserved ("jegelve") listing is no longer buyable, but it isn't gone either --
+    # it's kept in `valid` (with reserved=True) so it's stored and so its eventual
+    # closure counts as a confirmed one, but it's excluded below from both the
+    # asking-price median and from being flagged as a deal.
     valid = []
     for listing in raw_listings:
         if pricing.is_excluded(listing["title"]):
@@ -80,50 +84,21 @@ def run_cycle(conn, config: dict) -> None:
         if not model_key:
             continue
         price, reserved = pricing.parse_price(listing["price_text"])
-        if price is None or reserved:
+        if price is None:
             continue
         posted_at, posted_display = pricing.parse_posted_at(listing.get("posted_raw"))
         listing["model_key"] = model_key
         listing["price"] = price
         listing["posted_at"] = posted_at
         listing["posted_display"] = posted_display
+        listing["reserved"] = reserved
         valid.append(listing)
-
-    by_group = {}
-    for listing in valid:
-        group_key = (listing["category_key"], listing["model_key"])
-        by_group.setdefault(group_key, []).append(listing["price"])
-
-    medians = {
-        group: statistics.median(prices)
-        for group, prices in by_group.items()
-        if len(prices) >= config["min_sample_size"]
-    }
-
-    threshold = config["discount_threshold"]
-    flagged = []
-    for listing in valid:
-        group_key = (listing["category_key"], listing["model_key"])
-        median = medians.get(group_key)
-        if median is None:
-            continue
-        if listing["price"] <= median * (1 - threshold):
-            if not storage.is_alerted(conn, listing["ad_id"]):
-                flagged.append((listing, median))
-
-    # Oldest first, newest last -- on Discord the last embed in a message sits at
-    # the bottom, i.e. closest to the reader's eye, so the newest finds end up there.
-    def _posted_sort_key(entry):
-        dt = entry[0].get("posted_at")
-        return (0, datetime.min) if dt is None else (1, dt.replace(tzinfo=None))
-
-    flagged.sort(key=_posted_sort_key)
 
     storage.upsert_seen(conn, valid, bootstrap_categories=bootstrap)
 
     # Close out ads the site no longer lists, then bank this run as the baseline the
     # next cycle checks itself against. Compared against every id we scraped (not just
-    # the priced ones) so a reserved or unparseable ad isn't mistaken for a sale.
+    # the priced ones) so an unparseable ad isn't mistaken for a sale.
     closed_total = 0
     for cat in config["categories"]:
         present, complete = scrapes[cat["key"]]
@@ -140,18 +115,69 @@ def run_cycle(conn, config: dict) -> None:
 
     market = storage.get_market_stats(conn)
 
+    sellable = [listing for listing in valid if not listing["reserved"]]
+
+    by_group = {}
+    for listing in sellable:
+        group_key = (listing["category_key"], listing["model_key"])
+        by_group.setdefault(group_key, []).append(listing["price"])
+
+    live_medians = {
+        group: statistics.median(prices)
+        for group, prices in by_group.items()
+        if len(prices) >= config["min_sample_size"]
+    }
+
+    min_n = config["min_sample_size"]
+
+    def reference_price(group_key):
+        """What "underpriced" gets compared against, best signal first.
+
+        An asking-price median can be inflated by stuff that just never sells, so
+        prefer what things actually closed for -- confirmed (went through 'jegelve')
+        over any closure over the live asking median -- as soon as each has enough
+        of a sample to not be noise. Falls back down the list, never partway.
+        """
+        stats = market.get(group_key)
+        if stats:
+            if (stats.get("confirmed_closed_30d") or 0) >= min_n and stats.get("median_confirmed_closed_price") is not None:
+                return stats["median_confirmed_closed_price"], "confirmed sales"
+            if (stats.get("closed_30d") or 0) >= min_n and stats.get("median_closed_price") is not None:
+                return stats["median_closed_price"], "closed listings"
+        return live_medians.get(group_key), "asking price"
+
+    threshold = config["discount_threshold"]
+    flagged = []
+    for listing in sellable:
+        group_key = (listing["category_key"], listing["model_key"])
+        median, basis = reference_price(group_key)
+        if median is None:
+            continue
+        if listing["price"] <= median * (1 - threshold):
+            if not storage.is_alerted(conn, listing["ad_id"]):
+                flagged.append((listing, median, basis))
+
+    # Oldest first, newest last -- on Discord the last embed in a message sits at
+    # the bottom, i.e. closest to the reader's eye, so the newest finds end up there.
+    def _posted_sort_key(entry):
+        dt = entry[0].get("posted_at")
+        return (0, datetime.min) if dt is None else (1, dt.replace(tzinfo=None))
+
+    flagged.sort(key=_posted_sort_key)
+
     alerts = []
-    for listing, median in flagged:
+    for listing, median, basis in flagged:
         discount_pct = round((1 - listing["price"] / median) * 100, 1)
         profit = median - listing["price"]
         stats = market.get((listing["category_key"], listing["model_key"]))
         log.info(
-            "UNDERPRICED [%s/%s] %s -- %s Ft (median %s Ft, profit %s Ft, %s%% below) -- posted=%s seller=%s rating=%s loc=%s -- %s",
+            "UNDERPRICED [%s/%s] %s -- %s Ft (median %s Ft [%s], profit %s Ft, %s%% below) -- posted=%s seller=%s rating=%s loc=%s -- %s",
             listing["category_label"],
             listing["model_key"],
             listing["title"],
             f"{listing['price']:,}",
             f"{median:,.0f}",
+            basis,
             f"{profit:,.0f}",
             discount_pct,
             listing.get("posted_display"),
@@ -160,7 +186,7 @@ def run_cycle(conn, config: dict) -> None:
             listing.get("location"),
             listing["url"],
         )
-        alerts.append((listing, median, discount_pct, stats))
+        alerts.append((listing, median, discount_pct, stats, basis))
         storage.mark_alerted(conn, listing)
 
     discord_notify.send_deal_alerts(config.get("discord_channels"), alerts)
@@ -170,10 +196,11 @@ def run_cycle(conn, config: dict) -> None:
     # vacuum (or a deploy's ALTER TABLE) while it waits.
     conn.rollback()
 
+    priced_group_count = sum(1 for group_key in by_group if reference_price(group_key)[0] is not None)
     log.info(
-        "Cycle done: %d scraped, %d priced listings, %d models with enough samples, "
+        "Cycle done: %d scraped, %d priced listings (%d reserved), %d models with a usable reference price, "
         "%d new deals flagged, %d ads closed.",
-        len(raw_listings), len(valid), len(medians), len(flagged), closed_total,
+        len(raw_listings), len(valid), len(valid) - len(sellable), priced_group_count, len(flagged), closed_total,
     )
 
 

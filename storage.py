@@ -41,6 +41,13 @@ MIGRATIONS = [
     "ALTER TABLE seen_ads ADD COLUMN IF NOT EXISTS gone_at TIMESTAMPTZ",
     "ALTER TABLE seen_ads ADD COLUMN IF NOT EXISTS posted_at TIMESTAMPTZ",
     "ALTER TABLE seen_ads ADD COLUMN IF NOT EXISTS arrival_confirmed BOOLEAN NOT NULL DEFAULT TRUE",
+    # hardverapro's own "jegelve" (frozen/reserved) marker: a seller sets this once a
+    # buyer is lined up. It's sticky (OR'd across cycles in upsert_seen) so a listing
+    # that goes active -> reserved -> active again (deal fell through, relisted) still
+    # remembers it had a live buyer at some point -- that's a materially stronger
+    # closure signal than "the ad just vanished", which could equally mean withdrawn
+    # or expired.
+    "ALTER TABLE seen_ads ADD COLUMN IF NOT EXISTS was_reserved BOOLEAN NOT NULL DEFAULT FALSE",
     "CREATE INDEX IF NOT EXISTS idx_seen_ads_market ON seen_ads (category_key, model_key, status)",
     "CREATE INDEX IF NOT EXISTS idx_seen_ads_gone_at ON seen_ads (gone_at)",
     "CREATE INDEX IF NOT EXISTS idx_scrape_runs_cat ON scrape_runs (category_key, started_at DESC)",
@@ -138,15 +145,19 @@ def _baseline_count(conn: psycopg.Connection, category_key: str):
 
 def mark_gone(conn: psycopg.Connection, category_key: str, present_ad_ids: set,
                gone_at: datetime, complete: bool, backfill: bool = False) -> int:
-    """Close out every active ad in this category that the site no longer lists.
+    """Close out every active or reserved ad in this category that the site no
+    longer lists.
 
     hardverapro archives an ad when it leaves the index -- whether it sold, was
     withdrawn, or expired looks identical from outside -- so this records a
-    *closure*, not a confirmed sale.
+    *closure*, not a confirmed sale. A closure out of 'reserved' is much more
+    likely a real sale than one straight out of 'active' (was_reserved carries
+    that distinction forward), but both still count as closures here.
 
     `present_ad_ids` must be every ad id scraped this cycle, including ones the
-    watcher filtered out (reserved, unparseable price, ...): those are still live
-    listings, and treating them as gone would invent closures every cycle.
+    watcher filtered out for pricing purposes (unparseable price, ...): those are
+    still live listings, and treating them as gone would invent closures every
+    cycle.
 
     `backfill=True` closes the ads out without a timestamp: on the first cycle for
     a category, everything missing has been gone for an unknown length of time, and
@@ -162,7 +173,7 @@ def mark_gone(conn: psycopg.Connection, category_key: str, present_ad_ids: set,
 
     cur = conn.execute(
         "UPDATE seen_ads SET status = 'gone', gone_at = %s "
-        "WHERE category_key = %s AND status = 'active' AND NOT (ad_id = ANY(%s))",
+        "WHERE category_key = %s AND status IN ('active', 'reserved') AND NOT (ad_id = ANY(%s))",
         (None if backfill else gone_at, category_key, list(present_ad_ids)),
     )
     conn.commit()
@@ -176,20 +187,28 @@ def upsert_seen(conn: psycopg.Connection, listings: list, bootstrap_categories=f
     when we started watching, so we never saw it arrive and its age is a lower bound
     -- `bootstrap_categories` marks those as arrival_confirmed = FALSE so the
     time-to-close median only uses ads we watched from birth. An ad that reappears
-    after being closed goes back to active, which quietly undoes a false closure.
+    after being closed goes back to active/reserved (whichever it is this cycle),
+    which quietly undoes a false closure.
+
+    A listing with `reserved=True` (hardverapro's "jegelve" marker) is stored with
+    status='reserved' rather than 'active' -- it's still not gone, but it's no
+    longer available to buy, so it shouldn't be priced against as an active asking
+    price. was_reserved is sticky: once True it stays True across cycles even if
+    the ad goes back to 'active', so a later closure still remembers it had a buyer.
     """
     now = datetime.now(timezone.utc).isoformat()
     for l in listings:
         county = counties.resolve_county(l.get("location"))
+        status = "reserved" if l.get("reserved") else "active"
         conn.execute(
             """
             INSERT INTO seen_ads (
                 ad_id, title, category_key, category_label, model_key, price, url,
                 seller, rating, location, county, posted_display, posted_at, image_url,
-                first_seen, last_seen, alerted, status, gone_at, arrival_confirmed
+                first_seen, last_seen, alerted, status, gone_at, arrival_confirmed, was_reserved
             )
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0,
-                    'active', NULL, %s)
+                    %s, NULL, %s, %s)
             ON CONFLICT (ad_id) DO UPDATE SET
                 title=excluded.title,
                 category_key=excluded.category_key,
@@ -205,15 +224,18 @@ def upsert_seen(conn: psycopg.Connection, listings: list, bootstrap_categories=f
                 posted_at=excluded.posted_at,
                 image_url=excluded.image_url,
                 last_seen=excluded.last_seen,
-                status='active',
-                gone_at=NULL
+                status=excluded.status,
+                gone_at=NULL,
+                was_reserved=seen_ads.was_reserved OR excluded.was_reserved
             """,
             (
                 l["ad_id"], l["title"], l.get("category_key"), l.get("category_label"),
                 l.get("model_key"), l.get("price"), l["url"], l.get("seller"), l.get("rating"),
                 l.get("location"), county, l.get("posted_display"), l.get("posted_at"),
                 l.get("image_url"), now, now,
+                status,
                 l.get("category_key") not in bootstrap_categories,
+                bool(l.get("reserved")),
             ),
         )
     conn.commit()
@@ -232,6 +254,7 @@ MARKET_SQL = """
         category_label,
         model_key,
         COUNT(*) FILTER (WHERE status = 'active') AS count,
+        COUNT(*) FILTER (WHERE status = 'reserved') AS reserved_now,
         MIN(price) FILTER (WHERE status = 'active') AS min_price,
         MAX(price) FILTER (WHERE status = 'active') AS max_price,
         percentile_cont(0.5) WITHIN GROUP (ORDER BY price::double precision)
@@ -240,6 +263,8 @@ MARKET_SQL = """
             AS closed_7d,
         COUNT(*) FILTER (WHERE status = 'gone' AND gone_at >= now() - interval '30 days')
             AS closed_30d,
+        COUNT(*) FILTER (WHERE status = 'gone' AND was_reserved AND gone_at >= now() - interval '30 days')
+            AS confirmed_closed_30d,
         MAX(gone_at) AS last_closed_at,
         percentile_cont(0.5) WITHIN GROUP (
             ORDER BY EXTRACT(EPOCH FROM (gone_at - first_seen::timestamptz)) / 86400.0
@@ -247,7 +272,13 @@ MARKET_SQL = """
             AS median_days_to_close,
         percentile_cont(0.5) WITHIN GROUP (ORDER BY price::double precision)
             FILTER (WHERE status = 'gone' AND gone_at >= now() - interval '30 days')
-            AS median_closed_price
+            AS median_closed_price,
+        -- Same as median_closed_price but restricted to closures that passed through
+        -- 'reserved' first (a real buyer, per hardverapro's own "jegelve" marker) --
+        -- the more trustworthy of the two when there's enough sample to use it.
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY price::double precision)
+            FILTER (WHERE status = 'gone' AND was_reserved AND gone_at >= now() - interval '30 days')
+            AS median_confirmed_closed_price
     FROM seen_ads
     WHERE model_key IS NOT NULL AND price IS NOT NULL
 """
@@ -273,6 +304,7 @@ def get_model_summary(conn: psycopg.Connection, category_key: str = None, q: str
     sql += """
         GROUP BY category_key, category_label, model_key
         HAVING COUNT(*) FILTER (WHERE status = 'active') > 0
+            OR COUNT(*) FILTER (WHERE status = 'reserved') > 0
             OR COUNT(*) FILTER (WHERE status = 'gone' AND gone_at IS NOT NULL) > 0
     """
 

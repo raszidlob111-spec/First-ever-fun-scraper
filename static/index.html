@@ -198,9 +198,11 @@ function heatHtml(m) {
 function liquidityLine(m) {
   if (!m.closed_30d) return '<span class="stale">nincs még forgalmi adat</span>';
   const bits = [`${m.closed_30d} zárult/30n`];
+  if (m.confirmed_closed_30d) bits.push(`${m.confirmed_closed_30d} megerősített`);
   if (m.median_days_to_close !== null && m.median_days_to_close !== undefined) {
     bits.push('~' + fmtDays(m.median_days_to_close));
   }
+  if (m.reserved_now) bits.push(`${m.reserved_now} foglalva most`);
   return heatHtml(m) + ' ' + bits.join(' · ');
 }
 
@@ -298,6 +300,8 @@ async function loadMarket() {
   note.className = 'note';
   note.innerHTML = 'A hardverapro ugyanúgy archiválja a hirdetést, akár elkelt, akár '
     + 'visszavonták vagy lejárt — ezért <strong>lezárás</strong>, nem garantált eladás. '
+    + 'A <strong>megerősített</strong> lezárások viszont a hirdetés saját "jegelve" '
+    + 'jelölésén mentek keresztül, tehát tényleg volt vevő rá. '
     + 'A „Forgás” az elmúlt 30 nap lezárásainak aránya a teljes kínálathoz képest.';
   view.appendChild(note);
 
@@ -313,8 +317,8 @@ async function loadMarket() {
 
   const table = document.createElement('table');
   table.innerHTML = `<thead><tr>
-    <th>Forgás</th><th>Modell</th><th>Aktív</th><th>Zárult 7n</th><th>Zárult 30n</th>
-    <th>Medián idő</th><th>Utolsó zárás</th><th>Medián ár</th><th>Lezárt medián</th>
+    <th>Forgás</th><th>Modell</th><th>Aktív</th><th>Foglalt</th><th>Zárult 7n</th><th>Zárult 30n</th>
+    <th>Megerősített</th><th>Medián idő</th><th>Utolsó zárás</th><th>Medián ár</th><th>Lezárt medián</th>
   </tr></thead>`;
   const tbody = document.createElement('tbody');
 
@@ -325,8 +329,10 @@ async function loadMarket() {
       <td>${heatHtml(m)}</td>
       <td><strong>${escapeHtml(m.model_key)}</strong></td>
       <td>${m.count}</td>
+      <td>${m.reserved_now || 0}</td>
       <td>${m.closed_7d}</td>
       <td>${m.closed_30d}</td>
+      <td>${m.confirmed_closed_30d || 0}</td>
       <td>${fmtDays(m.median_days_to_close)}</td>
       <td>${fmtAgo(m.last_closed_at)}</td>
       <td class="price">${fmtFt(m.median_price)}</td>
