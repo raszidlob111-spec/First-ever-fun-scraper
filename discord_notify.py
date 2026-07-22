@@ -63,6 +63,7 @@ def _build_embed(listing: dict, median: float, discount_pct: float, profit: floa
             {"name": "Below median", "value": f"{discount_pct}%", "inline": True},
             {"name": "Category", "value": listing.get("category_label") or "n/a", "inline": True},
             {"name": "Model", "value": listing["model_key"], "inline": True},
+            {"name": "Brand", "value": listing.get("manufacturer") or "n/a", "inline": True},
             # Not inline: gets its own full-width row, mid-embed where it's read.
             {"name": "Liquidity", "value": _liquidity_value(stats), "inline": False},
             {"name": "Posted", "value": listing.get("posted_display") or "n/a", "inline": True},
