@@ -5,6 +5,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 import counties
+import pricing
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS seen_ads (
@@ -48,7 +49,11 @@ MIGRATIONS = [
     # closure signal than "the ad just vanished", which could equally mean withdrawn
     # or expired.
     "ALTER TABLE seen_ads ADD COLUMN IF NOT EXISTS was_reserved BOOLEAN NOT NULL DEFAULT FALSE",
+    # AIB manufacturer (Asus, Gigabyte, ...), GPU-only -- derived purely from title
+    # text, so it's always re-derivable from scratch and never needs re-scraping.
+    "ALTER TABLE seen_ads ADD COLUMN IF NOT EXISTS manufacturer TEXT",
     "CREATE INDEX IF NOT EXISTS idx_seen_ads_market ON seen_ads (category_key, model_key, status)",
+    "CREATE INDEX IF NOT EXISTS idx_seen_ads_market_mfr ON seen_ads (category_key, model_key, manufacturer, status)",
     "CREATE INDEX IF NOT EXISTS idx_seen_ads_gone_at ON seen_ads (gone_at)",
     "CREATE INDEX IF NOT EXISTS idx_scrape_runs_cat ON scrape_runs (category_key, started_at DESC)",
 ]
@@ -91,7 +96,36 @@ def init_db(database_url: str = None) -> psycopg.Connection:
         conn.execute(statement)
     conn.execute(BACKFILL_ARRIVAL)
     conn.commit()
+    backfill_manufacturer(conn)
     return conn
+
+
+def backfill_manufacturer(conn: psycopg.Connection, category_key: str = "gpu") -> int:
+    """Derive `manufacturer` for GPU ads stored before brand detection existed.
+
+    Title text never changes, so this is always losslessly re-derivable from what's
+    already in the table -- no re-scraping needed. Only rows still missing a
+    manufacturer are considered, so this is cheap and idempotent on every startup;
+    a title with no recognizable brand stays NULL and gets re-checked next time
+    (harmless, and lets a future alias addition pick it up automatically).
+    """
+    rows = conn.execute(
+        "SELECT ad_id, title FROM seen_ads WHERE category_key = %s AND manufacturer IS NULL",
+        (category_key,),
+    ).fetchall()
+
+    updated = 0
+    for row in rows:
+        manufacturer = pricing.detect_manufacturer(row["title"])
+        if manufacturer:
+            conn.execute(
+                "UPDATE seen_ads SET manufacturer = %s WHERE ad_id = %s",
+                (manufacturer, row["ad_id"]),
+            )
+            updated += 1
+
+    conn.commit()
+    return updated
 
 
 def is_alerted(conn: psycopg.Connection, ad_id: str) -> bool:
@@ -205,10 +239,11 @@ def upsert_seen(conn: psycopg.Connection, listings: list, bootstrap_categories=f
             INSERT INTO seen_ads (
                 ad_id, title, category_key, category_label, model_key, price, url,
                 seller, rating, location, county, posted_display, posted_at, image_url,
-                first_seen, last_seen, alerted, status, gone_at, arrival_confirmed, was_reserved
+                first_seen, last_seen, alerted, status, gone_at, arrival_confirmed, was_reserved,
+                manufacturer
             )
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0,
-                    %s, NULL, %s, %s)
+                    %s, NULL, %s, %s, %s)
             ON CONFLICT (ad_id) DO UPDATE SET
                 title=excluded.title,
                 category_key=excluded.category_key,
@@ -226,7 +261,8 @@ def upsert_seen(conn: psycopg.Connection, listings: list, bootstrap_categories=f
                 last_seen=excluded.last_seen,
                 status=excluded.status,
                 gone_at=NULL,
-                was_reserved=seen_ads.was_reserved OR excluded.was_reserved
+                was_reserved=seen_ads.was_reserved OR excluded.was_reserved,
+                manufacturer=excluded.manufacturer
             """,
             (
                 l["ad_id"], l["title"], l.get("category_key"), l.get("category_label"),
@@ -236,6 +272,7 @@ def upsert_seen(conn: psycopg.Connection, listings: list, bootstrap_categories=f
                 status,
                 l.get("category_key") not in bootstrap_categories,
                 bool(l.get("reserved")),
+                l.get("manufacturer"),
             ),
         )
     conn.commit()
@@ -330,6 +367,40 @@ def get_market_stats(conn: psycopg.Connection):
     """Every model's turnover stats, keyed by (category_key, model_key)."""
     rows = get_model_summary(conn)
     return {(r["category_key"], r["model_key"]): r for r in rows}
+
+
+# Same closure-quality tiers as MARKET_SQL, split one level finer by AIB manufacturer.
+# Deliberately a separate query rather than a parameterized MARKET_SQL: this only
+# needs the fields the pricing cascade actually reads, and keeping it standalone
+# means it can't accidentally change model_key-level stats used elsewhere (the web
+# UI's market summary, sell-through, etc).
+MANUFACTURER_MARKET_SQL = """
+    SELECT
+        category_key,
+        model_key,
+        manufacturer,
+        COUNT(*) FILTER (WHERE status = 'gone' AND gone_at >= now() - interval '30 days')
+            AS closed_30d,
+        COUNT(*) FILTER (WHERE status = 'gone' AND was_reserved AND gone_at >= now() - interval '30 days')
+            AS confirmed_closed_30d,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY price::double precision)
+            FILTER (WHERE status = 'gone' AND gone_at >= now() - interval '30 days')
+            AS median_closed_price,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY price::double precision)
+            FILTER (WHERE status = 'gone' AND was_reserved AND gone_at >= now() - interval '30 days')
+            AS median_confirmed_closed_price
+    FROM seen_ads
+    WHERE model_key IS NOT NULL AND price IS NOT NULL AND manufacturer IS NOT NULL
+    GROUP BY category_key, model_key, manufacturer
+"""
+
+
+def get_manufacturer_market_stats(conn: psycopg.Connection):
+    """Closure stats per (category_key, model_key, manufacturer), for models where
+    the manufacturer is known. Callers fall back to the chip-wide stats from
+    get_market_stats() when a given model/manufacturer pair has no entry here."""
+    rows = [dict(r) for r in conn.execute(MANUFACTURER_MARKET_SQL)]
+    return {(r["category_key"], r["model_key"], r["manufacturer"]): r for r in rows}
 
 
 def get_listings(conn: psycopg.Connection, category_key: str = None, model_key: str = None,

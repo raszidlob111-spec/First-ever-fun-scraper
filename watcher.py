@@ -92,6 +92,12 @@ def run_cycle(conn, config: dict) -> None:
         listing["posted_at"] = posted_at
         listing["posted_display"] = posted_display
         listing["reserved"] = reserved
+        # AIB manufacturer only means anything for GPUs -- an Asus TUF and a bare
+        # OEM card under the same model_key trade at different prices, but "brand"
+        # isn't a meaningful axis for a CPU/RAM/SSD listing the same way.
+        listing["manufacturer"] = (
+            pricing.detect_manufacturer(listing["title"]) if listing["category_key"] == "gpu" else None
+        )
         valid.append(listing)
 
     storage.upsert_seen(conn, valid, bootstrap_categories=bootstrap)
@@ -114,43 +120,71 @@ def run_cycle(conn, config: dict) -> None:
         storage.record_scrape_run(conn, cat["key"], cycle_start, len(present), complete)
 
     market = storage.get_market_stats(conn)
+    market_by_mfr = storage.get_manufacturer_market_stats(conn)
 
     sellable = [listing for listing in valid if not listing["reserved"]]
 
     by_group = {}
+    by_group_mfr = {}
     for listing in sellable:
         group_key = (listing["category_key"], listing["model_key"])
         by_group.setdefault(group_key, []).append(listing["price"])
+        if listing.get("manufacturer"):
+            by_group_mfr.setdefault(group_key + (listing["manufacturer"],), []).append(listing["price"])
+
+    min_n = config["min_sample_size"]
 
     live_medians = {
         group: statistics.median(prices)
         for group, prices in by_group.items()
-        if len(prices) >= config["min_sample_size"]
+        if len(prices) >= min_n
+    }
+    live_medians_mfr = {
+        group: statistics.median(prices)
+        for group, prices in by_group_mfr.items()
+        if len(prices) >= min_n
     }
 
-    min_n = config["min_sample_size"]
+    def _tiered_price(stats, live_median):
+        """Shared cascade: confirmed sales (went through 'jegelve') -> any closed
+        listing -> live asking median, each gated by min_n so a thin sample never
+        outranks a thicker, less-trusted one. Returns (None, None) if nothing at
+        this granularity clears the bar."""
+        if stats:
+            if (stats.get("confirmed_closed_30d") or 0) >= min_n and stats.get("median_confirmed_closed_price") is not None:
+                return stats["median_confirmed_closed_price"], "confirmed sales"
+            if (stats.get("closed_30d") or 0) >= min_n and stats.get("median_closed_price") is not None:
+                return stats["median_closed_price"], "closed listings"
+        if live_median is not None:
+            return live_median, "asking price"
+        return None, None
 
-    def reference_price(group_key):
+    def reference_price(group_key, manufacturer):
         """What "underpriced" gets compared against, best signal first.
 
         An asking-price median can be inflated by stuff that just never sells, so
         prefer what things actually closed for -- confirmed (went through 'jegelve')
         over any closure over the live asking median -- as soon as each has enough
         of a sample to not be noise. Falls back down the list, never partway.
+
+        Also tries the listing's own manufacturer (Asus, Gigabyte, ...) before the
+        chip-wide numbers: an Asus TUF and a bare OEM card under the same model_key
+        trade at different prices, so the manufacturer-specific cascade is a
+        strictly better comparison once it has enough history of its own -- falls
+        back to the chip-wide cascade otherwise, never partway between the two.
         """
-        stats = market.get(group_key)
-        if stats:
-            if (stats.get("confirmed_closed_30d") or 0) >= min_n and stats.get("median_confirmed_closed_price") is not None:
-                return stats["median_confirmed_closed_price"], "confirmed sales"
-            if (stats.get("closed_30d") or 0) >= min_n and stats.get("median_closed_price") is not None:
-                return stats["median_closed_price"], "closed listings"
-        return live_medians.get(group_key), "asking price"
+        if manufacturer:
+            mfr_key = group_key + (manufacturer,)
+            price, basis = _tiered_price(market_by_mfr.get(mfr_key), live_medians_mfr.get(mfr_key))
+            if price is not None:
+                return price, f"{basis}, {manufacturer}"
+        return _tiered_price(market.get(group_key), live_medians.get(group_key))
 
     threshold = config["discount_threshold"]
     flagged = []
     for listing in sellable:
         group_key = (listing["category_key"], listing["model_key"])
-        median, basis = reference_price(group_key)
+        median, basis = reference_price(group_key, listing.get("manufacturer"))
         if median is None:
             continue
         if listing["price"] <= median * (1 - threshold):
@@ -196,7 +230,7 @@ def run_cycle(conn, config: dict) -> None:
     # vacuum (or a deploy's ALTER TABLE) while it waits.
     conn.rollback()
 
-    priced_group_count = sum(1 for group_key in by_group if reference_price(group_key)[0] is not None)
+    priced_group_count = sum(1 for group_key in by_group if reference_price(group_key, None)[0] is not None)
     log.info(
         "Cycle done: %d scraped, %d priced listings (%d reserved), %d models with a usable reference price, "
         "%d new deals flagged, %d ads closed.",

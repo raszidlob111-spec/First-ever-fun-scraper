@@ -15,6 +15,32 @@ QUADRO_RE = re.compile(r"\bQUADRO\s?([A-Z]?\d{3,4})\b", re.IGNORECASE)
 
 VRAM_RE = re.compile(r"\b(\d{1,2})\s?GB\b", re.IGNORECASE)
 
+MANUFACTURER_RE = re.compile(
+    r"\b(ASUS|GIGABYTE|MSI|SAPPHIRE|POWERCOLOR|ZOTAC|GAINWARD|PALIT|XFX|INNO3D|COLORFUL|ASROCK|PNY|GALAX)\b",
+    re.IGNORECASE,
+)
+
+# Model-line names that identify a single manufacturer even when the manufacturer's
+# own name is never in the title -- hardverapro sellers routinely write "TUF RTX 3070"
+# without ever saying "Asus". Checked longest-first so e.g. "PHANTOM GAMING" (Asrock)
+# is matched before the shorter, differently-owned "PHANTOM" (Gainward). Deliberately
+# omits ambiguous names shared across brands (e.g. "DUAL", used by both Asus and
+# Palit) -- a wrong guess there is worse than falling back to no manufacturer at all.
+SUBLINE_TO_MANUFACTURER = {
+    "ROG STRIX": "ASUS", "TUF": "ASUS", "STRIX": "ASUS", "PRIME": "ASUS",
+    "AORUS": "GIGABYTE", "EAGLE": "GIGABYTE", "WINDFORCE": "GIGABYTE",
+    "GAMING TRIO": "MSI", "GAMING X": "MSI", "SUPRIM": "MSI", "VENTUS": "MSI",
+    "NITRO": "SAPPHIRE", "PULSE": "SAPPHIRE",
+    "RED DEVIL": "POWERCOLOR", "RED DRAGON": "POWERCOLOR", "HELLHOUND": "POWERCOLOR", "FIGHTER": "POWERCOLOR",
+    "AMP": "ZOTAC", "TRINITY": "ZOTAC",
+    "GHOST": "GAINWARD", "PHANTOM": "GAINWARD",
+    "GAMEROCK": "PALIT", "JETSTREAM": "PALIT",
+    "SPEEDSTER": "XFX", "MERC": "XFX",
+    "ICHILL": "INNO3D",
+    "IGAME": "COLORFUL",
+    "PHANTOM GAMING": "ASROCK", "TAICHI": "ASROCK",
+}
+
 PRICE_RE = re.compile(r"([\d\s.,]+)\s*(M)?\s*Ft", re.IGNORECASE)
 
 EXCLUDE_KEYWORDS = [
@@ -114,6 +140,24 @@ def normalize_model(title: str):
         key += f" {vm.group(1)}GB"
 
     return key
+
+
+def detect_manufacturer(title: str):
+    """Return the AIB manufacturer (e.g. 'ASUS'), inferred from either the brand
+    name itself or one of its known model-line names, or None if neither is
+    recognizable. Manufacturer takes priority: a title mentioning both the brand
+    and a subline resolves via the explicit brand name."""
+    t = title.upper()
+
+    m = MANUFACTURER_RE.search(t)
+    if m:
+        return m.group(1).upper()
+
+    for subline in sorted(SUBLINE_TO_MANUFACTURER, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(subline)}\b", t):
+            return SUBLINE_TO_MANUFACTURER[subline]
+
+    return None
 
 
 def parse_price(raw: str):
