@@ -90,22 +90,43 @@ def _post_with_retry(webhook_url: str, payload: dict) -> None:
     resp.raise_for_status()
 
 
+def _min_profit_for_price(tiers: list, price: float):
+    """Minimum profit required at this price, from a list of
+    {max_price, min_profit_huf} tiers ordered ascending by max_price -- the
+    last tier's max_price should be null/omitted to mean "no upper bound".
+    Returns None if `tiers` is empty (no floor configured, i.e. every profit
+    clears)."""
+    if not tiers:
+        return None
+    for tier in tiers:
+        max_price = tier.get("max_price")
+        if max_price is None or price <= max_price:
+            return tier["min_profit_huf"]
+    return tiers[-1]["min_profit_huf"]
+
+
 def _channel_for_discount_pct(channels: list, discount_pct: float, profit: float, price: float) -> dict:
     """Pick the channel whose min_discount_pct is the highest threshold the
-    discount still clears, among channels whose optional min_profit_pct (profit
-    as a fraction of price) is also cleared. `channels` should cover down to 0
-    with no profit floor so every alert matches something.
+    discount still clears, among channels whose optional min_profit_tiers is
+    also cleared for this price. `channels` should cover down to 0 with no
+    profit tiers so every alert matches something.
 
     Percentage below reference is the primary split: it lines up with the color
     tiers (>=25% is the red/dark-red band a trader flip can actually trust;
     below that is the noisier gold/orange band). But a fixed percentage alone
     conflates a small cheap item with a thin margin and a big expensive item
-    with the same thin margin -- 40k Ft profit is a fine reason to bother on a
-    60k item and noise on a 1.1M one, same capital and risk either way isn't
-    the point, the *proportional* payout is. min_profit_pct (currently only set
-    on the high tier) requires the profit to actually be a meaningful cut of
-    the price, not just a percentage that happens to look big in absolute Ft
-    on an expensive card.
+    with the same thin margin -- what's actually "worth bothering with" turned
+    out not to be a fixed percentage OR a fixed Ft amount, but a Ft floor that
+    steps up with price (roughly: parcel delivery covers cheap cards cheaply,
+    so the floor is low up to ~230k; above that it's in-person only, and the
+    floor climbs with price up to a plateau around 50k for anything over 900k).
+    min_profit_tiers (currently only set on the high tier) encodes that step
+    table directly rather than approximating it with one number.
+
+    Deliberately does NOT account for bringing several cards on one trip (the
+    per-card bar drops when a trip is already happening for another reason) --
+    that depends on knowing what else is active at alert time, which isn't
+    something a single listing's evaluation can see.
 
     Naming note, since this bit us once: "cheap" in the channel names (config.json's
     "Moonbag"/"Pennies") refers to cheap/small *profit*, not a cheap *price* -- the
@@ -117,8 +138,8 @@ def _channel_for_discount_pct(channels: list, discount_pct: float, profit: float
     best = None
     for channel in channels:
         threshold = channel.get("min_discount_pct", 0)
-        profit_floor_pct = channel.get("min_profit_pct")
-        if profit_floor_pct is not None and profit < profit_floor_pct * price:
+        min_profit = _min_profit_for_price(channel.get("min_profit_tiers", []), price)
+        if min_profit is not None and profit < min_profit:
             continue
         if discount_pct >= threshold and (best is None or threshold > best.get("min_discount_pct", 0)):
             best = channel
