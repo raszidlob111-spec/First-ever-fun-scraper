@@ -47,8 +47,15 @@ EXCLUDE_KEYWORDS = [
     "hibas", "serult", "alkatresznek",
     "bontott", "bontasra", "nem mukodik", "csak csere",
     "cserelnem", "elcserelnem", "csereajanlat",
-    "ures doboz", "csak doboz", "dobozok",
+    "ures doboz", "dobozok",
 ]
+
+# Sellers offering only the empty box (not the card itself) reliably shout it --
+# "!!!DOBOZ!!!" is the standard hardverapro convention for this, distinct from a
+# normal listing that just mentions the original box as a bonus somewhere in the
+# title (e.g. "eredeti dobozzal"). Matched separately from EXCLUDE_KEYWORDS since
+# it needs the emphasis/phrasing context, not just the bare word "doboz".
+BOX_ONLY_RE = re.compile(r"[!*]{2,}\s*doboz\s*[!*]{2,}|\bcsak\s+(a\s+)?doboz\b")
 
 
 def _fold(text: str) -> str:
@@ -63,7 +70,9 @@ def _fold(text: str) -> str:
 
 def is_excluded(title: str) -> bool:
     t = _fold(title.lower())
-    return any(kw in t for kw in EXCLUDE_KEYWORDS)
+    if any(kw in t for kw in EXCLUDE_KEYWORDS):
+        return True
+    return bool(BOX_ONLY_RE.search(t))
 
 
 def estimate_release_year(prefix: str, num: int):

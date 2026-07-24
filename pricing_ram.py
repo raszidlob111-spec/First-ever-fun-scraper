@@ -6,6 +6,13 @@ SINGLE_CAPACITY_RE = re.compile(r"\b(\d{1,3})\s?GB\b", re.IGNORECASE)
 SPEED_RE = re.compile(r"\b(\d{3,5})\s?MHZ\b", re.IGNORECASE)
 LAPTOP_RE = re.compile(r"SODIMM|NOTEBOOK|LAPTOP", re.IGNORECASE)
 
+# A shop offering several different capacities in one listing ("8/ 16/ 32GB") has
+# one price covering the cheapest of them, not the one _find_capacity_gb would
+# pick -- comparing that price against the priciest capacity's median invents a
+# huge fake discount. No way to recover which capacity the price actually means,
+# so these get excluded rather than guessed at.
+MULTI_CAPACITY_RE = re.compile(r"(?:\d{1,3}\s*/\s*){1,}\d{1,3}\s?GB", re.IGNORECASE)
+
 
 def _find_capacity_gb(t: str):
     """Leftmost capacity mention wins: a stated total ("32GB (2x16GB)") comes
@@ -26,15 +33,17 @@ def normalize_model(title: str):
     """Return a normalized RAM key like 'DDR4 16GB 3200MHz' (SO- prefixed for
     laptop/SODIMM modules so they aren't compared against desktop DIMM prices).
 
-    For a genuine multi-kit lot listing (several different capacities offered
-    together) this can still misattribute price to the wrong capacity -- an
-    accepted tradeoff for keeping this a simple regex instead of a real title
-    parser.
+    Returns None for a multi-capacity lot listing ("8/16/32GB") -- see
+    MULTI_CAPACITY_RE -- since the single listed price can't be reliably
+    attributed to just one of the offered capacities.
     """
     t = title.upper()
 
     ddr = DDR_RE.search(t)
     if not ddr:
+        return None
+
+    if MULTI_CAPACITY_RE.search(t):
         return None
 
     capacity_gb = _find_capacity_gb(t)
