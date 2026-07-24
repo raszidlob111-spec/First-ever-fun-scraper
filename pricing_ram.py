@@ -5,7 +5,11 @@ KIT_CAPACITY_RE = re.compile(r"\b(\d)\s?[xX]\s?(\d{1,3})\s?GB\b", re.IGNORECASE)
 KIT_LABEL_RE = re.compile(r"\b(\d{1,3})\s?GB\s?KIT\b", re.IGNORECASE)
 SINGLE_CAPACITY_RE = re.compile(r"\b(\d{1,3})\s?GB\b", re.IGNORECASE)
 SPEED_RE = re.compile(r"\b(\d{3,5})\s?MHZ\b", re.IGNORECASE)
-LAPTOP_RE = re.compile(r"SODIMM|NOTEBOOK|LAPTOP", re.IGNORECASE)
+# "SO-?DIMM" (optional hyphen) since "so-dimm" is a common real-world spelling
+# that a bare "SODIMM" literal misses -- confirmed against a real listing
+# ("Transcend DDR4 so-dimm 3200 8GB ram") that was silently priced against
+# desktop RAM instead of other laptop sticks before this.
+LAPTOP_RE = re.compile(r"SO-?DIMM|NOTEBOOK|LAPTOP", re.IGNORECASE)
 
 # Recognizable gaming/heatsink product lines. Unlike GPUs, RAM price doesn't split
 # cleanly by parent brand -- Kingston, Corsair, G.Skill etc. all trade in the same
@@ -24,8 +28,47 @@ KNOWN_LINE_RE = re.compile(
 # one price covering the cheapest of them, not the one _find_capacity_gb would
 # pick -- comparing that price against the priciest capacity's median invents a
 # huge fake discount. No way to recover which capacity the price actually means,
-# so these get excluded rather than guessed at.
-MULTI_CAPACITY_RE = re.compile(r"(?:\d{1,3}\s*/\s*){1,}\d{1,3}\s?GB", re.IGNORECASE)
+# so these get excluded rather than guessed at. Anchored with \b before the first
+# digit so it can't start matching mid-token -- without it, "DDR4 / 32 GB" reads
+# the trailing "4" off of "DDR4" as if it were a second capacity option ("4GB or
+# 32GB"), falsely excluding an otherwise unambiguous single-capacity listing.
+# Only catches the bare-number-chain phrasing ("8/16/32GB") -- see
+# _has_slash_separated_capacities for the "each option restates GB" phrasing
+# ("32GB DDR5 / 16GB DDR5 / 8GB DDR5") this doesn't match at all.
+MULTI_CAPACITY_RE = re.compile(r"\b(?:\d{1,3}\s*/\s*){1,}\d{1,3}\s?GB", re.IGNORECASE)
+
+# A hyphenated range ("16-32Gb") is the same ambiguity as a slash-separated list,
+# just a different separator -- "we have 16 to 32GB available" isn't one capacity.
+CAPACITY_RANGE_RE = re.compile(r"\b\d{1,3}\s*-\s*\d{1,3}\s?GB\b", re.IGNORECASE)
+
+# A shop listing multiple distinct manufacturers in one title/ad is very likely a
+# catalog of several different products bundled under one ad (confirmed against a
+# real listing titled "... Corsair, G.Skill, Samsung ..." whose displayed price
+# turned out to belong to an unrelated, unmentioned item elsewhere in the ad body)
+# -- same "ambiguous means excluded" logic pricing_cpu.py already uses for titles
+# naming more than one distinct CPU model.
+RAM_BRAND_RE = re.compile(
+    r"\b(KINGSTON|CORSAIR|G\.?\s?SKILL|SAMSUNG|CRUCIAL|SILICON\s?POWER|ADATA|TEAM\s?GROUP|"
+    r"HYPERX|PATRIOT|HYNIX|MICRON|PNY|GOODRAM|APACER|TRANSCEND|GEIL)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_slash_separated_capacities(t: str) -> bool:
+    """True if the title lists 2+ distinct capacities as slash-separated
+    alternatives even when each one restates its own "GB" and other words sit
+    between them ("32GB DDR5 / 16GB DDR5 / 8GB DDR5") -- MULTI_CAPACITY_RE alone
+    only catches the bare-number-chain phrasing ("8/16/32GB"), since here every
+    number already has its own GB suffix with no bare digit/slash chain to
+    match. A "/" between two *different* capacity values is the signal; the
+    same value repeated (a total restated with its own breakdown) isn't."""
+    matches = list(SINGLE_CAPACITY_RE.finditer(t))
+    for a, b in zip(matches, matches[1:]):
+        if a.group(1) == b.group(1):
+            continue
+        if "/" in t[a.end():b.start()]:
+            return True
+    return False
 
 
 def _find_capacity_gb(t: str):
@@ -56,9 +99,10 @@ def normalize_model(title: str):
     """Return a normalized RAM key like 'DDR4 16GB 3200MHz' (SO- prefixed for
     laptop/SODIMM modules so they aren't compared against desktop DIMM prices).
 
-    Returns None for a multi-capacity lot listing ("8/16/32GB") -- see
-    MULTI_CAPACITY_RE -- since the single listed price can't be reliably
-    attributed to just one of the offered capacities.
+    Returns None for a multi-capacity lot listing ("8/16/32GB" or "16-32GB") or a
+    multi-brand catalog listing ("... Corsair, G.Skill, Samsung ...") -- see
+    MULTI_CAPACITY_RE, CAPACITY_RANGE_RE and RAM_BRAND_RE -- since the single
+    listed price can't be reliably attributed to just one of several items.
     """
     t = title.upper()
 
@@ -66,7 +110,11 @@ def normalize_model(title: str):
     if not ddr:
         return None
 
-    if MULTI_CAPACITY_RE.search(t):
+    if MULTI_CAPACITY_RE.search(t) or _has_slash_separated_capacities(t) or CAPACITY_RANGE_RE.search(t):
+        return None
+
+    brands = {re.sub(r"\s+", " ", m.group(1).upper()) for m in RAM_BRAND_RE.finditer(t)}
+    if len(brands) > 1:
         return None
 
     capacity_gb = _find_capacity_gb(t)
