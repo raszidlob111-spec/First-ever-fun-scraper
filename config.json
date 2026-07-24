@@ -14,12 +14,21 @@
     "log_path": "watcher.log",
     "discord_channels": [
         {
-            "label": "Cheap (25%+ below reference)",
+            "label": "Moonbag (25%+ below reference AND profit clears the price-tier floor -- usable profit)",
             "webhook_url": "https://discord.com/api/webhooks/1526949511749173339/mKGJNxsTq6-D5VP3I3oN93nL0evhJu0_2-CzDmJZQJVutCh544sGp1ZBvL6X-Q4roCkI",
-            "min_discount_pct": 25
+            "min_discount_pct": 25,
+            "min_profit_tiers": [
+                {"max_price": 230000, "min_profit_huf": 12000},
+                {"max_price": 300000, "min_profit_huf": 20000},
+                {"max_price": 400000, "min_profit_huf": 25000},
+                {"max_price": 600000, "min_profit_huf": 30000},
+                {"max_price": 800000, "min_profit_huf": 35000},
+                {"max_price": 900000, "min_profit_huf": 40000},
+                {"max_price": null, "min_profit_huf": 50000}
+            ]
         },
         {
-            "label": "Marginal (10-25% below reference)",
+            "label": "Pennies (10-25% below reference -- small profit, no bother)",
             "webhook_url": "https://discord.com/api/webhooks/1527531051944251582/3moBtD8KkV3aJPHMU6uZR2J2VUv7qpAR8kdgUec6YsBC0aqx8qu3vgokdSa0Ngh_FHfh",
             "min_discount_pct": 0
         }

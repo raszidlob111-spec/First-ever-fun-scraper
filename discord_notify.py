@@ -90,20 +90,57 @@ def _post_with_retry(webhook_url: str, payload: dict) -> None:
     resp.raise_for_status()
 
 
-def _channel_for_discount_pct(channels: list, discount_pct: float) -> dict:
-    """Pick the channel whose min_discount_pct is the highest threshold the
-    discount still clears. `channels` should cover down to 0 so every alert
-    matches something.
+def _min_profit_for_price(tiers: list, price: float):
+    """Minimum profit required at this price, from a list of
+    {max_price, min_profit_huf} tiers ordered ascending by max_price -- the
+    last tier's max_price should be null/omitted to mean "no upper bound".
+    Returns None if `tiers` is empty (no floor configured, i.e. every profit
+    clears)."""
+    if not tiers:
+        return None
+    for tier in tiers:
+        max_price = tier.get("max_price")
+        if max_price is None or price <= max_price:
+            return tier["min_profit_huf"]
+    return tiers[-1]["min_profit_huf"]
 
-    Percentage below reference, not absolute Ft profit, is the split: it lines
-    up with the color tiers (>=25% is the red/dark-red band a trader flip can
-    actually trust; below that is the noisier gold/orange band), whereas profit
-    alone conflated a small cheap item with a thin margin and a big expensive
-    item with a thin margin.
+
+def _channel_for_discount_pct(channels: list, discount_pct: float, profit: float, price: float) -> dict:
+    """Pick the channel whose min_discount_pct is the highest threshold the
+    discount still clears, among channels whose optional min_profit_tiers is
+    also cleared for this price. `channels` should cover down to 0 with no
+    profit tiers so every alert matches something.
+
+    Percentage below reference is the primary split: it lines up with the color
+    tiers (>=25% is the red/dark-red band a trader flip can actually trust;
+    below that is the noisier gold/orange band). But a fixed percentage alone
+    conflates a small cheap item with a thin margin and a big expensive item
+    with the same thin margin -- what's actually "worth bothering with" turned
+    out not to be a fixed percentage OR a fixed Ft amount, but a Ft floor that
+    steps up with price (roughly: parcel delivery covers cheap cards cheaply,
+    so the floor is low up to ~230k; above that it's in-person only, and the
+    floor climbs with price up to a plateau around 50k for anything over 900k).
+    min_profit_tiers (currently only set on the high tier) encodes that step
+    table directly rather than approximating it with one number.
+
+    Deliberately does NOT account for bringing several cards on one trip (the
+    per-card bar drops when a trip is already happening for another reason) --
+    that depends on knowing what else is active at alert time, which isn't
+    something a single listing's evaluation can see.
+
+    Naming note, since this bit us once: "cheap" in the channel names (config.json's
+    "Moonbag"/"Pennies") refers to cheap/small *profit*, not a cheap *price* -- the
+    high-threshold channel (>=25%, the good tier) is "Moonbag", the low one
+    (10-25%, small margin, not worth the bother) is "Pennies". Higher
+    min_discount_pct always means the better tier, regardless of what a channel
+    happens to be called.
     """
     best = None
     for channel in channels:
         threshold = channel.get("min_discount_pct", 0)
+        min_profit = _min_profit_for_price(channel.get("min_profit_tiers", []), price)
+        if min_profit is not None and profit < min_profit:
+            continue
         if discount_pct >= threshold and (best is None or threshold > best.get("min_discount_pct", 0)):
             best = channel
     return best
@@ -130,13 +167,13 @@ def send_deal_alerts(channels: list, alerts: list) -> None:
     percentage (below the reference price) to whichever channel's
     min_discount_pct it clears.
 
-    `channels` is a list of {label, webhook_url, min_discount_pct} dicts.
-    `alerts` is a list of (listing, median, discount_pct, market_stats, basis)
-    tuples, already in the desired display order -- that order is preserved
-    within each channel. `market_stats` may be None for a model with no turnover
-    history yet. `basis` names what `median` was computed from (e.g. "confirmed
-    sales", "closed listings", "asking price"). No-op if no channels are
-    configured or the alert list is empty.
+    `channels` is a list of {label, webhook_url, min_discount_pct, min_profit_pct}
+    dicts (min_profit_pct optional). `alerts` is a list of (listing, median,
+    discount_pct, market_stats, basis) tuples, already in the desired display
+    order -- that order is preserved within each channel. `market_stats` may be
+    None for a model with no turnover history yet. `basis` names what `median`
+    was computed from (e.g. "confirmed sales", "closed listings", "asking
+    price"). No-op if no channels are configured or the alert list is empty.
     """
     if not channels or not alerts:
         return
@@ -144,7 +181,7 @@ def send_deal_alerts(channels: list, alerts: list) -> None:
     by_channel = {}
     for listing, median, discount_pct, stats, basis in alerts:
         profit = median - listing["price"]
-        channel = _channel_for_discount_pct(channels, discount_pct)
+        channel = _channel_for_discount_pct(channels, discount_pct, profit, listing["price"])
         if channel is None:
             log.warning("No Discord channel configured to cover discount_pct=%.1f, dropping alert", discount_pct)
             continue
