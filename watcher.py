@@ -104,12 +104,12 @@ def run_cycle(conn, config: dict) -> None:
         listing["posted_at"] = posted_at
         listing["posted_display"] = posted_display
         listing["reserved"] = reserved
-        # AIB manufacturer only means anything for GPUs -- an Asus TUF and a bare
-        # OEM card under the same model_key trade at different prices, but "brand"
-        # isn't a meaningful axis for a CPU/RAM/SSD listing the same way.
-        listing["manufacturer"] = (
-            pricing.detect_manufacturer(listing["title"]) if listing["category_key"] == "gpu" else None
-        )
+        # A brand/product-line split only helps where it actually separates the
+        # market (GPU AIB partner, RAM gaming line, ...) -- storage.MANUFACTURER_
+        # DETECTORS is the single source of truth for which categories have one;
+        # anything else just gets manufacturer=None and falls back to chip-wide.
+        detect_fn = storage.MANUFACTURER_DETECTORS.get(listing["category_key"])
+        listing["manufacturer"] = detect_fn(listing["title"]) if detect_fn else None
         valid.append(listing)
 
     storage.upsert_seen(conn, valid, bootstrap_categories=bootstrap)

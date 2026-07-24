@@ -6,6 +6,16 @@ from psycopg.rows import dict_row
 
 import counties
 import pricing
+import pricing_ram
+
+# Per-category brand/product-line detectors, used by both the startup backfill
+# and (mirrored in watcher.py) live scraping. Not every category has one --
+# categories without an entry here just get manufacturer=NULL and always fall
+# back to the chip-wide reference price.
+MANUFACTURER_DETECTORS = {
+    "gpu": pricing.detect_manufacturer,
+    "ram": pricing_ram.detect_manufacturer,
+}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS seen_ads (
@@ -100,8 +110,9 @@ def init_db(database_url: str = None) -> psycopg.Connection:
     return conn
 
 
-def backfill_manufacturer(conn: psycopg.Connection, category_key: str = "gpu") -> int:
-    """Derive `manufacturer` for GPU ads stored before brand detection existed.
+def backfill_manufacturer(conn: psycopg.Connection) -> int:
+    """Derive `manufacturer` for ads stored before brand/product-line detection
+    existed, for every category in MANUFACTURER_DETECTORS.
 
     Title text never changes, so this is always losslessly re-derivable from what's
     already in the table -- no re-scraping needed. Only rows still missing a
@@ -109,20 +120,21 @@ def backfill_manufacturer(conn: psycopg.Connection, category_key: str = "gpu") -
     a title with no recognizable brand stays NULL and gets re-checked next time
     (harmless, and lets a future alias addition pick it up automatically).
     """
-    rows = conn.execute(
-        "SELECT ad_id, title FROM seen_ads WHERE category_key = %s AND manufacturer IS NULL",
-        (category_key,),
-    ).fetchall()
-
     updated = 0
-    for row in rows:
-        manufacturer = pricing.detect_manufacturer(row["title"])
-        if manufacturer:
-            conn.execute(
-                "UPDATE seen_ads SET manufacturer = %s WHERE ad_id = %s",
-                (manufacturer, row["ad_id"]),
-            )
-            updated += 1
+    for category_key, detect_fn in MANUFACTURER_DETECTORS.items():
+        rows = conn.execute(
+            "SELECT ad_id, title FROM seen_ads WHERE category_key = %s AND manufacturer IS NULL",
+            (category_key,),
+        ).fetchall()
+
+        for row in rows:
+            manufacturer = detect_fn(row["title"])
+            if manufacturer:
+                conn.execute(
+                    "UPDATE seen_ads SET manufacturer = %s WHERE ad_id = %s",
+                    (manufacturer, row["ad_id"]),
+                )
+                updated += 1
 
     conn.commit()
     return updated
