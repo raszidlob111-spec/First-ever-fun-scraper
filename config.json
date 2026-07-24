@@ -14,12 +14,12 @@
     "log_path": "watcher.log",
     "discord_channels": [
         {
-            "label": "Cheap (25%+ below reference)",
+            "label": "Moonbag (25%+ below reference -- usable profit)",
             "webhook_url": "https://discord.com/api/webhooks/1526949511749173339/mKGJNxsTq6-D5VP3I3oN93nL0evhJu0_2-CzDmJZQJVutCh544sGp1ZBvL6X-Q4roCkI",
             "min_discount_pct": 25
         },
         {
-            "label": "Marginal (10-25% below reference)",
+            "label": "Pennies (10-25% below reference -- small profit, no bother)",
             "webhook_url": "https://discord.com/api/webhooks/1527531051944251582/3moBtD8KkV3aJPHMU6uZR2J2VUv7qpAR8kdgUec6YsBC0aqx8qu3vgokdSa0Ngh_FHfh",
             "min_discount_pct": 0
         }

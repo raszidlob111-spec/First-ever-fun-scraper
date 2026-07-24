@@ -100,6 +100,13 @@ def _channel_for_discount_pct(channels: list, discount_pct: float) -> dict:
     actually trust; below that is the noisier gold/orange band), whereas profit
     alone conflated a small cheap item with a thin margin and a big expensive
     item with a thin margin.
+
+    Naming note, since this bit us once: "cheap" in the channel names (config.json's
+    "Moonbag"/"Pennies") refers to cheap/small *profit*, not a cheap *price* -- the
+    high-threshold channel (>=25%, the good tier) is "Moonbag", the low one
+    (10-25%, small margin, not worth the bother) is "Pennies". Higher
+    min_discount_pct always means the better tier, regardless of what a channel
+    happens to be called.
     """
     best = None
     for channel in channels:
