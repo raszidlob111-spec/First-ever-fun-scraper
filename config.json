@@ -14,9 +14,10 @@
     "log_path": "watcher.log",
     "discord_channels": [
         {
-            "label": "Moonbag (25%+ below reference -- usable profit)",
+            "label": "Moonbag (25%+ below reference AND profit >= 6% of price -- usable profit)",
             "webhook_url": "https://discord.com/api/webhooks/1526949511749173339/mKGJNxsTq6-D5VP3I3oN93nL0evhJu0_2-CzDmJZQJVutCh544sGp1ZBvL6X-Q4roCkI",
-            "min_discount_pct": 25
+            "min_discount_pct": 25,
+            "min_profit_pct": 0.06
         },
         {
             "label": "Pennies (10-25% below reference -- small profit, no bother)",

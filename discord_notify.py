@@ -90,16 +90,22 @@ def _post_with_retry(webhook_url: str, payload: dict) -> None:
     resp.raise_for_status()
 
 
-def _channel_for_discount_pct(channels: list, discount_pct: float) -> dict:
+def _channel_for_discount_pct(channels: list, discount_pct: float, profit: float, price: float) -> dict:
     """Pick the channel whose min_discount_pct is the highest threshold the
-    discount still clears. `channels` should cover down to 0 so every alert
-    matches something.
+    discount still clears, among channels whose optional min_profit_pct (profit
+    as a fraction of price) is also cleared. `channels` should cover down to 0
+    with no profit floor so every alert matches something.
 
-    Percentage below reference, not absolute Ft profit, is the split: it lines
-    up with the color tiers (>=25% is the red/dark-red band a trader flip can
-    actually trust; below that is the noisier gold/orange band), whereas profit
-    alone conflated a small cheap item with a thin margin and a big expensive
-    item with a thin margin.
+    Percentage below reference is the primary split: it lines up with the color
+    tiers (>=25% is the red/dark-red band a trader flip can actually trust;
+    below that is the noisier gold/orange band). But a fixed percentage alone
+    conflates a small cheap item with a thin margin and a big expensive item
+    with the same thin margin -- 40k Ft profit is a fine reason to bother on a
+    60k item and noise on a 1.1M one, same capital and risk either way isn't
+    the point, the *proportional* payout is. min_profit_pct (currently only set
+    on the high tier) requires the profit to actually be a meaningful cut of
+    the price, not just a percentage that happens to look big in absolute Ft
+    on an expensive card.
 
     Naming note, since this bit us once: "cheap" in the channel names (config.json's
     "Moonbag"/"Pennies") refers to cheap/small *profit*, not a cheap *price* -- the
@@ -111,6 +117,9 @@ def _channel_for_discount_pct(channels: list, discount_pct: float) -> dict:
     best = None
     for channel in channels:
         threshold = channel.get("min_discount_pct", 0)
+        profit_floor_pct = channel.get("min_profit_pct")
+        if profit_floor_pct is not None and profit < profit_floor_pct * price:
+            continue
         if discount_pct >= threshold and (best is None or threshold > best.get("min_discount_pct", 0)):
             best = channel
     return best
@@ -137,13 +146,13 @@ def send_deal_alerts(channels: list, alerts: list) -> None:
     percentage (below the reference price) to whichever channel's
     min_discount_pct it clears.
 
-    `channels` is a list of {label, webhook_url, min_discount_pct} dicts.
-    `alerts` is a list of (listing, median, discount_pct, market_stats, basis)
-    tuples, already in the desired display order -- that order is preserved
-    within each channel. `market_stats` may be None for a model with no turnover
-    history yet. `basis` names what `median` was computed from (e.g. "confirmed
-    sales", "closed listings", "asking price"). No-op if no channels are
-    configured or the alert list is empty.
+    `channels` is a list of {label, webhook_url, min_discount_pct, min_profit_pct}
+    dicts (min_profit_pct optional). `alerts` is a list of (listing, median,
+    discount_pct, market_stats, basis) tuples, already in the desired display
+    order -- that order is preserved within each channel. `market_stats` may be
+    None for a model with no turnover history yet. `basis` names what `median`
+    was computed from (e.g. "confirmed sales", "closed listings", "asking
+    price"). No-op if no channels are configured or the alert list is empty.
     """
     if not channels or not alerts:
         return
@@ -151,7 +160,7 @@ def send_deal_alerts(channels: list, alerts: list) -> None:
     by_channel = {}
     for listing, median, discount_pct, stats, basis in alerts:
         profit = median - listing["price"]
-        channel = _channel_for_discount_pct(channels, discount_pct)
+        channel = _channel_for_discount_pct(channels, discount_pct, profit, listing["price"])
         if channel is None:
             log.warning("No Discord channel configured to cover discount_pct=%.1f, dropping alert", discount_pct)
             continue
