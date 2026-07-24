@@ -24,8 +24,31 @@ KNOWN_LINE_RE = re.compile(
 # one price covering the cheapest of them, not the one _find_capacity_gb would
 # pick -- comparing that price against the priciest capacity's median invents a
 # huge fake discount. No way to recover which capacity the price actually means,
-# so these get excluded rather than guessed at.
-MULTI_CAPACITY_RE = re.compile(r"(?:\d{1,3}\s*/\s*){1,}\d{1,3}\s?GB", re.IGNORECASE)
+# so these get excluded rather than guessed at. Anchored with \b before the first
+# digit so it can't start matching mid-token -- without it, "DDR4 / 32 GB" reads
+# the trailing "4" off of "DDR4" as if it were a second capacity option ("4GB or
+# 32GB"), falsely excluding an otherwise unambiguous single-capacity listing.
+# Only catches the bare-number-chain phrasing ("8/16/32GB") -- see
+# _has_slash_separated_capacities for the "each option restates GB" phrasing
+# ("32GB DDR5 / 16GB DDR5 / 8GB DDR5") this doesn't match at all.
+MULTI_CAPACITY_RE = re.compile(r"\b(?:\d{1,3}\s*/\s*){1,}\d{1,3}\s?GB", re.IGNORECASE)
+
+
+def _has_slash_separated_capacities(t: str) -> bool:
+    """True if the title lists 2+ distinct capacities as slash-separated
+    alternatives even when each one restates its own "GB" and other words sit
+    between them ("32GB DDR5 / 16GB DDR5 / 8GB DDR5") -- MULTI_CAPACITY_RE alone
+    only catches the bare-number-chain phrasing ("8/16/32GB"), since here every
+    number already has its own GB suffix with no bare digit/slash chain to
+    match. A "/" between two *different* capacity values is the signal; the
+    same value repeated (a total restated with its own breakdown) isn't."""
+    matches = list(SINGLE_CAPACITY_RE.finditer(t))
+    for a, b in zip(matches, matches[1:]):
+        if a.group(1) == b.group(1):
+            continue
+        if "/" in t[a.end():b.start()]:
+            return True
+    return False
 
 
 def _find_capacity_gb(t: str):
@@ -66,7 +89,7 @@ def normalize_model(title: str):
     if not ddr:
         return None
 
-    if MULTI_CAPACITY_RE.search(t):
+    if MULTI_CAPACITY_RE.search(t) or _has_slash_separated_capacities(t):
         return None
 
     capacity_gb = _find_capacity_gb(t)
