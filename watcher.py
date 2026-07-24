@@ -1,6 +1,5 @@
 import json
 import logging
-import statistics
 import sys
 import time
 from datetime import datetime, timezone
@@ -12,6 +11,19 @@ import pricing_ram
 import pricing_ssd
 import scraper
 import storage
+
+
+def _percentile(sorted_values: list, p: float) -> float:
+    """Linear-interpolation percentile matching Postgres's percentile_cont, so the
+    live asking-price fallback lines up with the closed-price tiers computed in SQL.
+    `sorted_values` must already be sorted ascending."""
+    n = len(sorted_values)
+    if n == 1:
+        return sorted_values[0]
+    idx = p * (n - 1)
+    lo = int(idx)
+    hi = min(lo + 1, n - 1)
+    return sorted_values[lo] + (idx - lo) * (sorted_values[hi] - sorted_values[lo])
 
 NORMALIZERS = {
     "gpu": pricing.normalize_model,
@@ -134,29 +146,32 @@ def run_cycle(conn, config: dict) -> None:
 
     min_n = config["min_sample_size"]
 
+    # Compared against the cheapest quarter of the market, not the whole of it --
+    # matches storage.DEAL_REFERENCE_PERCENTILE so the live asking-price fallback
+    # lines up with the closed-price tiers computed in SQL.
     live_medians = {
-        group: statistics.median(prices)
+        group: _percentile(sorted(prices), storage.DEAL_REFERENCE_PERCENTILE)
         for group, prices in by_group.items()
         if len(prices) >= min_n
     }
     live_medians_mfr = {
-        group: statistics.median(prices)
+        group: _percentile(sorted(prices), storage.DEAL_REFERENCE_PERCENTILE)
         for group, prices in by_group_mfr.items()
         if len(prices) >= min_n
     }
 
-    def _tiered_price(stats, live_median):
+    def _tiered_price(stats, live_reference):
         """Shared cascade: confirmed sales (went through 'jegelve') -> any closed
-        listing -> live asking median, each gated by min_n so a thin sample never
+        listing -> live asking reference, each gated by min_n so a thin sample never
         outranks a thicker, less-trusted one. Returns (None, None) if nothing at
         this granularity clears the bar."""
         if stats:
-            if (stats.get("confirmed_closed_30d") or 0) >= min_n and stats.get("median_confirmed_closed_price") is not None:
-                return stats["median_confirmed_closed_price"], "confirmed sales"
-            if (stats.get("closed_30d") or 0) >= min_n and stats.get("median_closed_price") is not None:
-                return stats["median_closed_price"], "closed listings"
-        if live_median is not None:
-            return live_median, "asking price"
+            if (stats.get("confirmed_closed_30d") or 0) >= min_n and stats.get("deal_ref_confirmed_closed_price") is not None:
+                return stats["deal_ref_confirmed_closed_price"], "confirmed sales"
+            if (stats.get("closed_30d") or 0) >= min_n and stats.get("deal_ref_closed_price") is not None:
+                return stats["deal_ref_closed_price"], "closed listings"
+        if live_reference is not None:
+            return live_reference, "asking price"
         return None, None
 
     def reference_price(group_key, manufacturer):

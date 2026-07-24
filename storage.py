@@ -285,7 +285,16 @@ def get_categories(conn: psycopg.Connection):
     return [dict(r) for r in rows]
 
 
-MARKET_SQL = """
+# The deal-detection reference price compares against the median of the *cheapest
+# quarter* of closures, not the whole market -- a buyer flipping for profit cares
+# whether this listing beats the going rate among other cheap ones, not the market
+# at large. Median-of-the-bottom-quartile is equivalent to the 12.5th percentile of
+# the full distribution (halfway into the bottom 25%). Purely descriptive stats
+# (Piac tab, "what's this model typically go for") keep the true median (0.5) --
+# only the pricing cascade in watcher.py reads the deal_ref_* columns below.
+DEAL_REFERENCE_PERCENTILE = 0.125
+
+MARKET_SQL = f"""
     SELECT
         category_key,
         category_label,
@@ -315,7 +324,13 @@ MARKET_SQL = """
         -- the more trustworthy of the two when there's enough sample to use it.
         percentile_cont(0.5) WITHIN GROUP (ORDER BY price::double precision)
             FILTER (WHERE status = 'gone' AND was_reserved AND gone_at >= now() - interval '30 days')
-            AS median_confirmed_closed_price
+            AS median_confirmed_closed_price,
+        percentile_cont({DEAL_REFERENCE_PERCENTILE}) WITHIN GROUP (ORDER BY price::double precision)
+            FILTER (WHERE status = 'gone' AND gone_at >= now() - interval '30 days')
+            AS deal_ref_closed_price,
+        percentile_cont({DEAL_REFERENCE_PERCENTILE}) WITHIN GROUP (ORDER BY price::double precision)
+            FILTER (WHERE status = 'gone' AND was_reserved AND gone_at >= now() - interval '30 days')
+            AS deal_ref_confirmed_closed_price
     FROM seen_ads
     WHERE model_key IS NOT NULL AND price IS NOT NULL
 """
@@ -374,7 +389,7 @@ def get_market_stats(conn: psycopg.Connection):
 # needs the fields the pricing cascade actually reads, and keeping it standalone
 # means it can't accidentally change model_key-level stats used elsewhere (the web
 # UI's market summary, sell-through, etc).
-MANUFACTURER_MARKET_SQL = """
+MANUFACTURER_MARKET_SQL = f"""
     SELECT
         category_key,
         model_key,
@@ -388,7 +403,13 @@ MANUFACTURER_MARKET_SQL = """
             AS median_closed_price,
         percentile_cont(0.5) WITHIN GROUP (ORDER BY price::double precision)
             FILTER (WHERE status = 'gone' AND was_reserved AND gone_at >= now() - interval '30 days')
-            AS median_confirmed_closed_price
+            AS median_confirmed_closed_price,
+        percentile_cont({DEAL_REFERENCE_PERCENTILE}) WITHIN GROUP (ORDER BY price::double precision)
+            FILTER (WHERE status = 'gone' AND gone_at >= now() - interval '30 days')
+            AS deal_ref_closed_price,
+        percentile_cont({DEAL_REFERENCE_PERCENTILE}) WITHIN GROUP (ORDER BY price::double precision)
+            FILTER (WHERE status = 'gone' AND was_reserved AND gone_at >= now() - interval '30 days')
+            AS deal_ref_confirmed_closed_price
     FROM seen_ads
     WHERE model_key IS NOT NULL AND price IS NOT NULL AND manufacturer IS NOT NULL
     GROUP BY category_key, model_key, manufacturer

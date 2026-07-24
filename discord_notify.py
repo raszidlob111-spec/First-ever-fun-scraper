@@ -58,7 +58,7 @@ def _build_embed(listing: dict, median: float, discount_pct: float, profit: floa
         "color": _color_for_discount(discount_pct),
         "fields": [
             {"name": "Price", "value": f"{listing['price']:,} Ft", "inline": True},
-            {"name": f"Median ({basis})", "value": f"{median:,.0f} Ft", "inline": True},
+            {"name": f"Low-tier median ({basis})", "value": f"{median:,.0f} Ft", "inline": True},
             {"name": "Profit", "value": f"{profit:,.0f} Ft", "inline": True},
             {"name": "Below median", "value": f"{discount_pct}%", "inline": True},
             {"name": "Category", "value": listing.get("category_label") or "n/a", "inline": True},
