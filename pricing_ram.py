@@ -37,6 +37,22 @@ KNOWN_LINE_RE = re.compile(
 # ("32GB DDR5 / 16GB DDR5 / 8GB DDR5") this doesn't match at all.
 MULTI_CAPACITY_RE = re.compile(r"\b(?:\d{1,3}\s*/\s*){1,}\d{1,3}\s?GB", re.IGNORECASE)
 
+# A hyphenated range ("16-32Gb") is the same ambiguity as a slash-separated list,
+# just a different separator -- "we have 16 to 32GB available" isn't one capacity.
+CAPACITY_RANGE_RE = re.compile(r"\b\d{1,3}\s*-\s*\d{1,3}\s?GB\b", re.IGNORECASE)
+
+# A shop listing multiple distinct manufacturers in one title/ad is very likely a
+# catalog of several different products bundled under one ad (confirmed against a
+# real listing titled "... Corsair, G.Skill, Samsung ..." whose displayed price
+# turned out to belong to an unrelated, unmentioned item elsewhere in the ad body)
+# -- same "ambiguous means excluded" logic pricing_cpu.py already uses for titles
+# naming more than one distinct CPU model.
+RAM_BRAND_RE = re.compile(
+    r"\b(KINGSTON|CORSAIR|G\.?\s?SKILL|SAMSUNG|CRUCIAL|SILICON\s?POWER|ADATA|TEAM\s?GROUP|"
+    r"HYPERX|PATRIOT|HYNIX|MICRON|PNY|GOODRAM|APACER|TRANSCEND|GEIL)\b",
+    re.IGNORECASE,
+)
+
 
 def _has_slash_separated_capacities(t: str) -> bool:
     """True if the title lists 2+ distinct capacities as slash-separated
@@ -83,9 +99,10 @@ def normalize_model(title: str):
     """Return a normalized RAM key like 'DDR4 16GB 3200MHz' (SO- prefixed for
     laptop/SODIMM modules so they aren't compared against desktop DIMM prices).
 
-    Returns None for a multi-capacity lot listing ("8/16/32GB") -- see
-    MULTI_CAPACITY_RE -- since the single listed price can't be reliably
-    attributed to just one of the offered capacities.
+    Returns None for a multi-capacity lot listing ("8/16/32GB" or "16-32GB") or a
+    multi-brand catalog listing ("... Corsair, G.Skill, Samsung ...") -- see
+    MULTI_CAPACITY_RE, CAPACITY_RANGE_RE and RAM_BRAND_RE -- since the single
+    listed price can't be reliably attributed to just one of several items.
     """
     t = title.upper()
 
@@ -93,7 +110,11 @@ def normalize_model(title: str):
     if not ddr:
         return None
 
-    if MULTI_CAPACITY_RE.search(t) or _has_slash_separated_capacities(t):
+    if MULTI_CAPACITY_RE.search(t) or _has_slash_separated_capacities(t) or CAPACITY_RANGE_RE.search(t):
+        return None
+
+    brands = {re.sub(r"\s+", " ", m.group(1).upper()) for m in RAM_BRAND_RE.finditer(t)}
+    if len(brands) > 1:
         return None
 
     capacity_gb = _find_capacity_gb(t)
