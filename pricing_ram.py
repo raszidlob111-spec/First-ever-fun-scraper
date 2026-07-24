@@ -5,7 +5,11 @@ KIT_CAPACITY_RE = re.compile(r"\b(\d)\s?[xX]\s?(\d{1,3})\s?GB\b", re.IGNORECASE)
 KIT_LABEL_RE = re.compile(r"\b(\d{1,3})\s?GB\s?KIT\b", re.IGNORECASE)
 SINGLE_CAPACITY_RE = re.compile(r"\b(\d{1,3})\s?GB\b", re.IGNORECASE)
 SPEED_RE = re.compile(r"\b(\d{3,5})\s?MHZ\b", re.IGNORECASE)
-LAPTOP_RE = re.compile(r"SODIMM|NOTEBOOK|LAPTOP", re.IGNORECASE)
+# "SO-?DIMM" (optional hyphen) since "so-dimm" is a common real-world spelling
+# that a bare "SODIMM" literal misses -- confirmed against a real listing
+# ("Transcend DDR4 so-dimm 3200 8GB ram") that was silently priced against
+# desktop RAM instead of other laptop sticks before this.
+LAPTOP_RE = re.compile(r"SO-?DIMM|NOTEBOOK|LAPTOP", re.IGNORECASE)
 
 # Recognizable gaming/heatsink product lines. Unlike GPUs, RAM price doesn't split
 # cleanly by parent brand -- Kingston, Corsair, G.Skill etc. all trade in the same
