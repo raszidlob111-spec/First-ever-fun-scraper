@@ -90,14 +90,21 @@ def _post_with_retry(webhook_url: str, payload: dict) -> None:
     resp.raise_for_status()
 
 
-def _channel_for_profit(channels: list, profit: float) -> dict:
-    """Pick the channel whose min_profit_huf is the highest threshold the
-    profit still clears. `channels` should cover down to 0 so every profit
-    matches something."""
+def _channel_for_discount_pct(channels: list, discount_pct: float) -> dict:
+    """Pick the channel whose min_discount_pct is the highest threshold the
+    discount still clears. `channels` should cover down to 0 so every alert
+    matches something.
+
+    Percentage below reference, not absolute Ft profit, is the split: it lines
+    up with the color tiers (>=25% is the red/dark-red band a trader flip can
+    actually trust; below that is the noisier gold/orange band), whereas profit
+    alone conflated a small cheap item with a thin margin and a big expensive
+    item with a thin margin.
+    """
     best = None
     for channel in channels:
-        threshold = channel.get("min_profit_huf", 0)
-        if profit >= threshold and (best is None or threshold > best.get("min_profit_huf", 0)):
+        threshold = channel.get("min_discount_pct", 0)
+        if discount_pct >= threshold and (best is None or threshold > best.get("min_discount_pct", 0)):
             best = channel
     return best
 
@@ -119,10 +126,11 @@ def _send_batch(webhook_url: str, label: str, embeds: list, total: int) -> None:
 
 
 def send_deal_alerts(channels: list, alerts: list) -> None:
-    """Post a batch of underpriced listings to Discord, routed by profit
-    (median - price) to whichever channel's min_profit_huf it clears.
+    """Post a batch of underpriced listings to Discord, routed by discount
+    percentage (below the reference price) to whichever channel's
+    min_discount_pct it clears.
 
-    `channels` is a list of {label, webhook_url, min_profit_huf} dicts.
+    `channels` is a list of {label, webhook_url, min_discount_pct} dicts.
     `alerts` is a list of (listing, median, discount_pct, market_stats, basis)
     tuples, already in the desired display order -- that order is preserved
     within each channel. `market_stats` may be None for a model with no turnover
@@ -136,9 +144,9 @@ def send_deal_alerts(channels: list, alerts: list) -> None:
     by_channel = {}
     for listing, median, discount_pct, stats, basis in alerts:
         profit = median - listing["price"]
-        channel = _channel_for_profit(channels, profit)
+        channel = _channel_for_discount_pct(channels, discount_pct)
         if channel is None:
-            log.warning("No Discord channel configured to cover profit=%.0f Ft, dropping alert", profit)
+            log.warning("No Discord channel configured to cover discount_pct=%.1f, dropping alert", discount_pct)
             continue
         by_channel.setdefault(channel["webhook_url"], (channel["label"], []))[1].append(
             _build_embed(listing, median, discount_pct, profit, stats, basis)
