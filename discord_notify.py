@@ -213,3 +213,72 @@ def send_deal_alerts(channels: list, alerts: list) -> list:
             continue
         sent.extend(_send_batch(webhook_url, label, items))
     return sent
+
+
+WANTED_MATCH_COLOR = 0x5865F2  # Discord blurple -- distinct from the price-deal color tiers,
+                                # since this isn't a discount signal, it's a demand/supply match.
+
+
+def _build_wanted_embed(match: dict) -> dict:
+    wanted = match["wanted"]
+    listings = match["listings"]
+    lines = [
+        f"[{l['title'][:80]}]({l['url']}) -- {l['price']:,} Ft ({l.get('location') or 'n/a'})"
+        for l in listings
+    ]
+    return {
+        "title": wanted["title"][:256],
+        "url": wanted["url"],
+        "color": WANTED_MATCH_COLOR,
+        "fields": [
+            {"name": "Category", "value": wanted.get("category_label") or "n/a", "inline": True},
+            {"name": "Model", "value": wanted.get("model_key") or "n/a", "inline": True},
+            {"name": "Seeker", "value": f"{wanted.get('seller') or 'n/a'} ({wanted.get('rating') or 'n/a'})", "inline": True},
+            {"name": f"Matching listing(s) -- {len(listings)}", "value": "\n".join(lines) or "n/a", "inline": False},
+        ],
+    }
+
+
+def send_wanted_matches(channel: dict, matches: list) -> dict:
+    """Post wanted-ad/available-listing matches to Discord.
+
+    `channel` is a single {label, webhook_url} dict -- no discount-tier routing
+    here, this isn't a price signal, just one destination for all matches.
+    `matches` is the list of {wanted, listings} dicts from
+    storage.find_new_wanted_matches().
+
+    Returns {wanted_ad_id: [sell_ad_id, ...]} for matches that actually posted
+    successfully -- mirrors send_deal_alerts: callers must only mark these as
+    notified (storage.mark_wanted_matched), not the full input, so a failed
+    send stays eligible to retry next cycle rather than being silently
+    dropped forever.
+    """
+    if not channel or not channel.get("webhook_url") or not matches:
+        return {}
+
+    webhook_url = channel["webhook_url"]
+    label = channel.get("label", "Wanted Match")
+    items = [(m, _build_wanted_embed(m)) for m in matches]
+
+    sent = {}
+    total = len(items)
+    for i in range(0, total, MAX_EMBEDS_PER_MESSAGE):
+        chunk = items[i : i + MAX_EMBEDS_PER_MESSAGE]
+        payload = {
+            "username": f"GPU Deal Watcher · {label}",
+            "embeds": [embed for _match, embed in chunk],
+        }
+        if i == 0:
+            payload["content"] = f"Found **{total}** wanted-ad match(es):"
+
+        try:
+            _post_with_retry(webhook_url, payload)
+            for match, _embed in chunk:
+                sent[match["wanted"]["ad_id"]] = [l["ad_id"] for l in match["listings"]]
+        except requests.RequestException:
+            log.exception("Failed to post wanted-match batch to %s (%d items) -- will retry next cycle",
+                           label, len(chunk))
+
+        if i + MAX_EMBEDS_PER_MESSAGE < total:
+            time.sleep(DELAY_BETWEEN_MESSAGES)
+    return sent

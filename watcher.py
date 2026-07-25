@@ -88,7 +88,14 @@ def run_cycle(conn, config: dict) -> None:
     # closure counts as a confirmed one, but it's excluded below from both the
     # asking-price median and from being flagged as a deal.
     valid = []
+    wanted_raw = []
     for listing in raw_listings:
+        # Checked before is_excluded() (which also catches "keresem"/"keresek" as a
+        # backstop) so a wanted ad gets routed to the matching pipeline instead of
+        # just being discarded.
+        if pricing.is_wanted_ad(listing["title"], listing.get("price_text")):
+            wanted_raw.append(listing)
+            continue
         if pricing.is_excluded(listing["title"]):
             continue
         normalize_fn = NORMALIZERS[listing["category_key"]]
@@ -114,6 +121,21 @@ def run_cycle(conn, config: dict) -> None:
 
     storage.upsert_seen(conn, valid, bootstrap_categories=bootstrap)
 
+    # "Keresem" ads that name a specific enough model to match against -- a vague
+    # "looking for a video card" has no model_key and can't be matched to anything.
+    wanted_valid = []
+    for listing in wanted_raw:
+        normalize_fn = NORMALIZERS[listing["category_key"]]
+        model_key = normalize_fn(listing["title"])
+        if not model_key:
+            continue
+        listing["model_key"] = model_key
+        detect_fn = storage.MANUFACTURER_DETECTORS.get(listing["category_key"])
+        listing["manufacturer"] = detect_fn(listing["title"]) if detect_fn else None
+        wanted_valid.append(listing)
+
+    storage.upsert_wanted(conn, wanted_valid)
+
     # Close out ads the site no longer lists, then bank this run as the baseline the
     # next cycle checks itself against. Compared against every id we scraped (not just
     # the priced ones) so an unparseable ad isn't mistaken for a sale.
@@ -128,6 +150,7 @@ def run_cycle(conn, config: dict) -> None:
             log.info("Backfilled %d already-closed %s ads (undated)", closed, cat["label"])
         elif closed:
             log.info("Closed %d %s ads no longer listed", closed, cat["label"])
+        storage.mark_wanted_gone(conn, cat["key"], present, cycle_start, complete)
         closed_total += closed
         storage.record_scrape_run(conn, cat["key"], cycle_start, len(present), complete)
 
@@ -249,6 +272,20 @@ def run_cycle(conn, config: dict) -> None:
     failed_count = len(alerts) - len(sent_listings)
     if failed_count:
         log.warning("%d alert(s) failed to post to Discord and will retry next cycle", failed_count)
+
+    # Someone explicitly wanting a model that's currently for sale is a stronger
+    # signal than any price math -- a known buyer already lined up. Checked against
+    # the whole active pool (not just this cycle's new listings), so an existing
+    # listing that was already up before the wanted ad appeared still counts.
+    wanted_matches = storage.find_new_wanted_matches(conn, max_matches=config.get("wanted_max_matches", 5))
+    if wanted_matches:
+        sent_matches = discord_notify.send_wanted_matches(config.get("wanted_channel"), wanted_matches)
+        for wanted_ad_id, sell_ad_ids in sent_matches.items():
+            storage.mark_wanted_matched(conn, wanted_ad_id, sell_ad_ids)
+        failed_matches = len(wanted_matches) - len(sent_matches)
+        log.info("Found %d wanted-ad match(es), %d posted to Discord%s",
+                  len(wanted_matches), len(sent_matches),
+                  f" ({failed_matches} failed, will retry)" if failed_matches else "")
 
     # Reads leave the connection "idle in transaction", and this one is about to sleep
     # for the whole interval -- release the snapshot so it doesn't pin locks and stall
