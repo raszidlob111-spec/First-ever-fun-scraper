@@ -36,6 +36,6 @@
     "wanted_max_matches": 5,
     "wanted_channel": {
         "label": "Wanted Matches",
-        "webhook_url": ""
+        "webhook_url": "https://discord.com/api/webhooks/1530608838481547334/pfnWkn-oA9Ly7yXPx35W9N4MoqQCSIw6fxYbMj99y9yLXHuDrJrWeWqC7sPAGP6i6cMY"
     }
 }
