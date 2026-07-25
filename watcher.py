@@ -236,9 +236,19 @@ def run_cycle(conn, config: dict) -> None:
             listing["url"],
         )
         alerts.append((listing, median, discount_pct, stats, basis))
+
+    # Only mark what actually made it to Discord -- marking on decision rather
+    # than on delivery meant a failed webhook POST (rate limit, network blip)
+    # got silently written off as handled, and since is_alerted() skips
+    # anything already marked, that listing could never be retried on a later
+    # cycle even though its alert never arrived.
+    sent_listings = discord_notify.send_deal_alerts(config.get("discord_channels"), alerts)
+    for listing in sent_listings:
         storage.mark_alerted(conn, listing)
 
-    discord_notify.send_deal_alerts(config.get("discord_channels"), alerts)
+    failed_count = len(alerts) - len(sent_listings)
+    if failed_count:
+        log.warning("%d alert(s) failed to post to Discord and will retry next cycle", failed_count)
 
     # Reads leave the connection "idle in transaction", and this one is about to sleep
     # for the whole interval -- release the snapshot so it doesn't pin locks and stall
