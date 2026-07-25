@@ -48,6 +48,14 @@ EXCLUDE_KEYWORDS = [
     "bontott", "bontasra", "nem mukodik", "csak csere",
     "cserelnem", "elcserelnem", "csereajanlat",
     "ures doboz", "dobozok",
+    # A genuine "Keresem" (wanted) ad shows literally "Keresem" where the price
+    # should be, so parse_price() already fails on it with no digits to find --
+    # no fix needed there. But some buyers post under the sell-ad form instead
+    # (title says "KERESEM ..." to clarify to a human reader, with some tiny
+    # junk placeholder price like 123 Ft since the form requires a number) --
+    # that price parses fine, and 123 Ft against any real reference reads as a
+    # ~99% "discount", a far more dangerous false positive than a normal miss.
+    "keresem", "keresek",
 ]
 
 # Sellers offering only the empty box (not the card itself) reliably shout it --
