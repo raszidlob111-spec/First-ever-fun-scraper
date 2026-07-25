@@ -146,23 +146,37 @@ def _channel_for_discount_pct(channels: list, discount_pct: float, profit: float
     return best
 
 
-def _send_batch(webhook_url: str, label: str, embeds: list, total: int) -> None:
-    for i in range(0, len(embeds), MAX_EMBEDS_PER_MESSAGE):
-        chunk = embeds[i : i + MAX_EMBEDS_PER_MESSAGE]
-        payload = {"username": f"GPU Deal Watcher · {label}", "embeds": chunk}
+def _send_batch(webhook_url: str, label: str, items: list) -> list:
+    """Posts (listing, embed) pairs in chunks under Discord's per-message embed
+    limit. Returns the `listing`s whose chunk actually posted successfully --
+    a chunk that fails stays out of the returned list entirely, since a caller
+    that marks something "alerted" without knowing the send failed would lose
+    it forever (is_alerted() would skip it on every future cycle even though
+    the notification never arrived)."""
+    total = len(items)
+    sent = []
+    for i in range(0, total, MAX_EMBEDS_PER_MESSAGE):
+        chunk = items[i : i + MAX_EMBEDS_PER_MESSAGE]
+        payload = {
+            "username": f"GPU Deal Watcher · {label}",
+            "embeds": [embed for _listing, embed in chunk],
+        }
         if i == 0:
             payload["content"] = f"Found **{total}** new underpriced listing(s):"
 
         try:
             _post_with_retry(webhook_url, payload)
+            sent.extend(listing for listing, _embed in chunk)
         except requests.RequestException:
-            log.exception("Failed to post Discord alert batch to %s (%d items)", label, len(chunk))
+            log.exception("Failed to post Discord alert batch to %s (%d items) -- will retry next cycle",
+                           label, len(chunk))
 
-        if i + MAX_EMBEDS_PER_MESSAGE < len(embeds):
+        if i + MAX_EMBEDS_PER_MESSAGE < total:
             time.sleep(DELAY_BETWEEN_MESSAGES)
+    return sent
 
 
-def send_deal_alerts(channels: list, alerts: list) -> None:
+def send_deal_alerts(channels: list, alerts: list) -> list:
     """Post a batch of underpriced listings to Discord, routed by discount
     percentage (below the reference price) to whichever channel's
     min_discount_pct it clears.
@@ -174,9 +188,14 @@ def send_deal_alerts(channels: list, alerts: list) -> None:
     None for a model with no turnover history yet. `basis` names what `median`
     was computed from (e.g. "confirmed sales", "closed listings", "asking
     price"). No-op if no channels are configured or the alert list is empty.
+
+    Returns the `listing`s that were actually successfully posted -- callers
+    must only mark these as alerted (storage.mark_alerted), not the full input
+    list, so a failed Discord send doesn't get treated as a delivered one and
+    silently dropped from ever being retried.
     """
     if not channels or not alerts:
-        return
+        return []
 
     by_channel = {}
     for listing, median, discount_pct, stats, basis in alerts:
@@ -185,11 +204,12 @@ def send_deal_alerts(channels: list, alerts: list) -> None:
         if channel is None:
             log.warning("No Discord channel configured to cover discount_pct=%.1f, dropping alert", discount_pct)
             continue
-        by_channel.setdefault(channel["webhook_url"], (channel["label"], []))[1].append(
-            _build_embed(listing, median, discount_pct, profit, stats, basis)
-        )
+        embed = _build_embed(listing, median, discount_pct, profit, stats, basis)
+        by_channel.setdefault(channel["webhook_url"], (channel["label"], []))[1].append((listing, embed))
 
-    for webhook_url, (label, embeds) in by_channel.items():
+    sent = []
+    for webhook_url, (label, items) in by_channel.items():
         if not webhook_url:
             continue
-        _send_batch(webhook_url, label, embeds, len(embeds))
+        sent.extend(_send_batch(webhook_url, label, items))
+    return sent
