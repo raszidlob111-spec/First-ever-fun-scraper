@@ -44,6 +44,39 @@ CREATE TABLE IF NOT EXISTS scrape_runs (
     listing_count INTEGER NOT NULL,
     complete BOOLEAN NOT NULL
 );
+
+-- "Keresem" (wanted/buying) ads, scraped from the same category pages as
+-- seen_ads but tracked separately -- there's no price to compare against a
+-- reference, the whole point of this table is matching against what's
+-- currently for sale (see wanted_matches).
+CREATE TABLE IF NOT EXISTS wanted_ads (
+    ad_id TEXT PRIMARY KEY,
+    title TEXT,
+    category_key TEXT,
+    category_label TEXT,
+    model_key TEXT,
+    manufacturer TEXT,
+    url TEXT,
+    seller TEXT,
+    rating TEXT,
+    location TEXT,
+    posted_display TEXT,
+    first_seen TEXT,
+    last_seen TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    gone_at TIMESTAMPTZ
+);
+
+-- Which (wanted ad, active sell ad) pairs have already been surfaced, so a
+-- match is only ever alerted once -- but a *new* sell listing appearing later
+-- for a wanted ad we already alerted about still gets its own alert, since
+-- that's a genuinely new opportunity, not a repeat of the old one.
+CREATE TABLE IF NOT EXISTS wanted_matches (
+    wanted_ad_id TEXT NOT NULL,
+    sell_ad_id TEXT NOT NULL,
+    notified_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (wanted_ad_id, sell_ad_id)
+);
 """
 
 # Applied on every startup; each statement is a no-op once it has run.
@@ -66,6 +99,7 @@ MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS idx_seen_ads_market_mfr ON seen_ads (category_key, model_key, manufacturer, status)",
     "CREATE INDEX IF NOT EXISTS idx_seen_ads_gone_at ON seen_ads (gone_at)",
     "CREATE INDEX IF NOT EXISTS idx_scrape_runs_cat ON scrape_runs (category_key, started_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_wanted_ads_match ON wanted_ads (category_key, model_key, status)",
 ]
 
 # The ads already in the table when this column was added arrived in one flood on
@@ -286,6 +320,124 @@ def upsert_seen(conn: psycopg.Connection, listings: list, bootstrap_categories=f
                 bool(l.get("reserved")),
                 l.get("manufacturer"),
             ),
+        )
+    conn.commit()
+
+
+def upsert_wanted(conn: psycopg.Connection, listings: list) -> None:
+    """Insert/refresh wanted ("Keresem") ads seen this cycle. Mirrors upsert_seen
+    but far simpler -- there's no price, no reserved/closure-quality tracking,
+    just enough to identify the model being sought and link back to the ad."""
+    now = datetime.now(timezone.utc).isoformat()
+    for l in listings:
+        conn.execute(
+            """
+            INSERT INTO wanted_ads (
+                ad_id, title, category_key, category_label, model_key, manufacturer,
+                url, seller, rating, location, posted_display, first_seen, last_seen,
+                status, gone_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'active', NULL)
+            ON CONFLICT (ad_id) DO UPDATE SET
+                title=excluded.title,
+                category_key=excluded.category_key,
+                category_label=excluded.category_label,
+                model_key=excluded.model_key,
+                manufacturer=excluded.manufacturer,
+                url=excluded.url,
+                seller=excluded.seller,
+                rating=excluded.rating,
+                location=excluded.location,
+                posted_display=excluded.posted_display,
+                last_seen=excluded.last_seen,
+                status='active',
+                gone_at=NULL
+            """,
+            (
+                l["ad_id"], l["title"], l.get("category_key"), l.get("category_label"),
+                l.get("model_key"), l.get("manufacturer"), l["url"], l.get("seller"),
+                l.get("rating"), l.get("location"), l.get("posted_display"), now, now,
+            ),
+        )
+    conn.commit()
+
+
+def mark_wanted_gone(conn: psycopg.Connection, category_key: str, present_ad_ids: set,
+                      gone_at: datetime, complete: bool) -> int:
+    """Close out wanted ads no longer listed -- same truncated-run guard as
+    mark_gone (present_ad_ids comes from the same scrape, so an incomplete run
+    would otherwise invent a flood of false closures)."""
+    if not complete:
+        return 0
+    cur = conn.execute(
+        "UPDATE wanted_ads SET status = 'gone', gone_at = %s "
+        "WHERE category_key = %s AND status = 'active' AND NOT (ad_id = ANY(%s))",
+        (gone_at, category_key, list(present_ad_ids)),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def find_new_wanted_matches(conn: psycopg.Connection, max_matches: int = 5):
+    """For every active wanted ad, find active sell listings of the same model
+    (and manufacturer, when the wanted ad names one) that haven't already been
+    surfaced for it -- see wanted_matches. Returns a list of
+    {wanted: {...}, listings: [{...}, ...]} dicts, cheapest listings first,
+    capped at `max_matches` per wanted ad. A wanted ad with no new match is
+    left out entirely (not repeatedly re-checked and reported empty).
+    """
+    rows = conn.execute(
+        """
+        SELECT w.*, s.ad_id AS sell_ad_id, s.title AS sell_title, s.price AS sell_price,
+               s.url AS sell_url, s.seller AS sell_seller, s.rating AS sell_rating,
+               s.location AS sell_location, s.manufacturer AS sell_manufacturer
+        FROM wanted_ads w
+        JOIN seen_ads s
+          ON s.category_key = w.category_key
+         AND s.model_key = w.model_key
+         AND s.status = 'active'
+         AND (w.manufacturer IS NULL OR s.manufacturer = w.manufacturer)
+        WHERE w.status = 'active'
+          AND NOT EXISTS (
+              SELECT 1 FROM wanted_matches m
+              WHERE m.wanted_ad_id = w.ad_id AND m.sell_ad_id = s.ad_id
+          )
+        ORDER BY w.ad_id, s.price ASC
+        """
+    ).fetchall()
+
+    grouped = {}
+    for row in rows:
+        wanted_id = row["ad_id"]
+        if wanted_id not in grouped:
+            grouped[wanted_id] = {
+                "wanted": {
+                    "ad_id": row["ad_id"], "title": row["title"],
+                    "category_label": row["category_label"], "model_key": row["model_key"],
+                    "manufacturer": row["manufacturer"], "url": row["url"],
+                    "seller": row["seller"], "rating": row["rating"],
+                    "location": row["location"], "posted_display": row["posted_display"],
+                },
+                "listings": [],
+            }
+        if len(grouped[wanted_id]["listings"]) < max_matches:
+            grouped[wanted_id]["listings"].append({
+                "ad_id": row["sell_ad_id"], "title": row["sell_title"], "price": row["sell_price"],
+                "url": row["sell_url"], "seller": row["sell_seller"], "rating": row["sell_rating"],
+                "location": row["sell_location"], "manufacturer": row["sell_manufacturer"],
+            })
+
+    return list(grouped.values())
+
+
+def mark_wanted_matched(conn: psycopg.Connection, wanted_ad_id: str, sell_ad_ids: list) -> None:
+    """Record that these sell ads have been surfaced for this wanted ad, so a
+    future cycle doesn't alert on the same pairing again."""
+    for sell_ad_id in sell_ad_ids:
+        conn.execute(
+            "INSERT INTO wanted_matches (wanted_ad_id, sell_ad_id) VALUES (%s, %s) "
+            "ON CONFLICT DO NOTHING",
+            (wanted_ad_id, sell_ad_id),
         )
     conn.commit()
 

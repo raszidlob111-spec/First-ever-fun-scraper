@@ -32,5 +32,10 @@
             "webhook_url": "https://discord.com/api/webhooks/1527531051944251582/3moBtD8KkV3aJPHMU6uZR2J2VUv7qpAR8kdgUec6YsBC0aqx8qu3vgokdSa0Ngh_FHfh",
             "min_discount_pct": 0
         }
-    ]
+    ],
+    "wanted_max_matches": 5,
+    "wanted_channel": {
+        "label": "Wanted Matches",
+        "webhook_url": "https://discord.com/api/webhooks/1530608838481547334/pfnWkn-oA9Ly7yXPx35W9N4MoqQCSIw6fxYbMj99y9yLXHuDrJrWeWqC7sPAGP6i6cMY"
+    }
 }

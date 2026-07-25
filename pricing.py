@@ -48,6 +48,14 @@ EXCLUDE_KEYWORDS = [
     "bontott", "bontasra", "nem mukodik", "csak csere",
     "cserelnem", "elcserelnem", "csereajanlat",
     "ures doboz", "dobozok",
+    # A genuine "Keresem" (wanted) ad shows literally "Keresem" where the price
+    # should be, so parse_price() already fails on it with no digits to find --
+    # no fix needed there. But some buyers post under the sell-ad form instead
+    # (title says "KERESEM ..." to clarify to a human reader, with some tiny
+    # junk placeholder price like 123 Ft since the form requires a number) --
+    # that price parses fine, and 123 Ft against any real reference reads as a
+    # ~99% "discount", a far more dangerous false positive than a normal miss.
+    "keresem", "keresek",
 ]
 
 # Sellers offering only the empty box (not the card itself) reliably shout it --
@@ -73,6 +81,22 @@ def is_excluded(title: str) -> bool:
     if any(kw in t for kw in EXCLUDE_KEYWORDS):
         return True
     return bool(BOX_ONLY_RE.search(t))
+
+
+WANTED_TITLE_RE = re.compile(r"\bkeresem\b|\bkeresek\b", re.IGNORECASE)
+
+
+def is_wanted_ad(title: str, price_text: str) -> bool:
+    """True for a "Keresem" (wanted/buying) ad rather than a real for-sale
+    listing -- either hardverapro's price column literally says "Keresem" (no
+    price given at all), or the poster used the sell-ad form by mistake but
+    named their real intent in the title, in which case any number shown is a
+    meaningless placeholder, not a real asking price. Checked before
+    is_excluded() so these get routed to the wanted-ad pipeline instead of
+    just being discarded."""
+    if price_text and _fold(price_text.strip().lower()) == "keresem":
+        return True
+    return bool(WANTED_TITLE_RE.search(_fold(title.lower())))
 
 
 def estimate_release_year(prefix: str, num: int):
